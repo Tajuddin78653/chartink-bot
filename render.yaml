@@ -9,3 +9,17 @@ services:
         sync: false
       - key: CHAT_ID
         sync: false
+      - key: PAPER_TRADING
+        value: "true"
+      - key: CAPITAL
+        value: "20000"
+      - key: RISK_PERCENT
+        value: "1"
+      - key: SL_PERCENT
+        value: "2"
+      - key: TRAIL_PERCENT
+        value: "2"
+      - key: MAX_TRADES
+        value: "2"
+      - key: SCAN_MINS
+        value: "5"
