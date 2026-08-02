@@ -1,168 +1,96 @@
-# app.py — Chartink Auto Scraper + Telegram Bot
-# Scrapes your screener every 5 mins — NO webhook needed!
-
+# app.py — Main Flask Server + Background Threads
 from flask import Flask, request, jsonify
 from datetime import datetime, time as dtime
-import requests, pytz, os, time, threading
+import pytz, os, time, threading
 
-app         = Flask(__name__)
-IST         = pytz.timezone("Asia/Kolkata")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-CHAT_ID     = os.environ.get("CHAT_ID", "")
-SCAN_MINS   = int(os.environ.get("SCAN_MINS", 5))  # Check every 5 mins
+from config       import PORT, SCAN_MINS, MARKET_OPEN, MARKET_CLOSE, TRADE_CUTOFF, FORCE_EXIT, MAX_TRADES, PAPER_TRADING
+from scanner      import get_new_stocks
+from paper_trader import open_trades, closed_today, open_trade, get_daily_summary
+from trailing_sl  import check_all_trades, get_live_price
+from daily_report import force_exit_all, send_eod_report
+from telegram_bot import send
 
-# ── Track previously seen stocks to avoid duplicate alerts ──
-last_stocks = set()
-
-# ══════════════════════════════════════════════════
-#  TELEGRAM
-# ══════════════════════════════════════════════════
-
-def send_telegram(msg):
-    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            print("✅ Telegram sent!")
-        else:
-            print(f"❌ Telegram error: {r.text}")
-    except Exception as e:
-        print(f"❌ Exception: {e}")
-
+app = Flask(__name__)
+IST = pytz.timezone("Asia/Kolkata")
 
 # ══════════════════════════════════════════════════
-#  CHARTINK SCRAPER
+#  TIME HELPERS
 # ══════════════════════════════════════════════════
 
-def fetch_chartink_screener():
-    """Fetch stocks from Chartink screener tazbul."""
-    try:
-        session = requests.Session()
+def now_time():
+    return datetime.now(IST).time()
 
-        # Step 1: Get CSRF token from screener page
-        page = session.get(
-            "https://chartink.com/screener/tazbul",
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        # Extract CSRF token
-        csrf_token = ""
-        for line in page.text.split("\n"):
-            if "csrf-token" in line and "content=" in line:
-                csrf_token = line.split('content="')[1].split('"')[0]
-                break
-
-        if not csrf_token:
-            # Try meta tag extraction
-            import re
-            match = re.search(r'meta name="csrf-token" content="(.+?)"', page.text)
-            if match:
-                csrf_token = match.group(1)
-
-        print(f"CSRF Token: {csrf_token[:20]}..." if csrf_token else "No CSRF found")
-
-        # Step 2: Call Chartink screener API
-        headers = {
-            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "X-Csrf-Token"    : csrf_token,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer"         : "https://chartink.com/screener/tazbul",
-            "Content-Type"    : "application/x-www-form-urlencoded"
-        }
-
-        response = session.post(
-            "https://chartink.com/screener/process",
-            data={"scan_clause": get_scan_clause(page.text)},
-            headers=headers,
-            timeout=15
-        )
-
-        data = response.json()
-        stocks = [item["nsecode"] for item in data.get("data", [])]
-        print(f"📊 Stocks found: {stocks}")
-        return stocks
-
-    except Exception as e:
-        print(f"❌ Scraper error: {e}")
-        return []
-
-
-def get_scan_clause(page_html):
-    """Extract scan clause from screener page HTML."""
-    import re
-    # Try to extract scan_clause from page
-    match = re.search(r'scan_clause\s*[=:]\s*["\'](.+?)["\']', page_html)
-    if match:
-        return match.group(1)
-    # Fallback — return empty
-    return ""
-
-
-# ══════════════════════════════════════════════════
-#  MARKET HOURS CHECK
-# ══════════════════════════════════════════════════
+def is_between(h1, m1, h2, m2):
+    return dtime(h1, m1) <= now_time() <= dtime(h2, m2)
 
 def is_market_hours():
-    now = datetime.now(IST).time()
-    return dtime(9, 15) <= now <= dtime(15, 30)
+    return is_between(*MARKET_OPEN, *MARKET_CLOSE)
+
+def can_enter_trade():
+    return is_between(*MARKET_OPEN, *TRADE_CUTOFF)
+
+def is_force_exit_time():
+    t = now_time()
+    return t >= dtime(*FORCE_EXIT)
 
 
 # ══════════════════════════════════════════════════
-#  FORMAT MESSAGE
-# ══════════════════════════════════════════════════
-
-def format_msg(stocks, screener="tazbul"):
-    now   = datetime.now(IST).strftime("%d %b %Y  %I:%M %p")
-    lines = "".join(f"  📌 <b>{s}</b>\n" for s in stocks)
-    return (
-        f"🔔 <b>CHARTINK ALERT</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{screener}</b>\n"
-        f"🕐 {now}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{lines}"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>DYOR before trading</i>"
-    )
-
-
-# ══════════════════════════════════════════════════
-#  BACKGROUND SCANNER THREAD
+#  BACKGROUND — SCANNER THREAD
 # ══════════════════════════════════════════════════
 
 def run_scanner():
-    """Background thread — scans Chartink every SCAN_MINS minutes."""
-    global last_stocks
-    print(f"🔍 Scanner started — checking every {SCAN_MINS} mins during market hours")
+    """Scan Chartink every SCAN_MINS minutes."""
+    print(f"🔍 Scanner started — every {SCAN_MINS} mins")
+    eod_sent = False
 
     while True:
-        if is_market_hours():
-            print(f"🔍 Scanning Chartink... [{datetime.now(IST).strftime('%I:%M %p')}]")
-            stocks = fetch_chartink_screener()
+        t = now_time()
 
-            if stocks:
-                # Find NEW stocks not seen in last scan
-                new_stocks = [s for s in stocks if s not in last_stocks]
+        # ── Force Exit at 3:15 PM ─────────────────
+        if t >= dtime(*FORCE_EXIT) and open_trades:
+            force_exit_all()
 
-                if new_stocks:
-                    print(f"🆕 New stocks: {new_stocks}")
-                    send_telegram(format_msg(new_stocks))
-                else:
-                    print("ℹ️ No new stocks since last scan")
+        # ── EOD Report at 3:30 PM ─────────────────
+        if t >= dtime(*MARKET_CLOSE) and not eod_sent:
+            send_eod_report()
+            eod_sent = True
 
-                last_stocks = set(stocks)
-            else:
-                print("📭 No stocks found in screener")
-        else:
-            print(f"⏰ Market closed — waiting... [{datetime.now(IST).strftime('%I:%M %p')}]")
-            last_stocks = set()  # Reset at end of day
+        # ── Reset EOD flag next morning ───────────
+        if t < dtime(9, 0):
+            eod_sent = False
+
+        # ── Scan for new stocks ───────────────────
+        if can_enter_trade():
+            new_stocks = get_new_stocks()
+
+            for symbol in new_stocks:
+                trades_today = len(closed_today) + len(open_trades)
+                if trades_today >= MAX_TRADES:
+                    print(f"🚫 Max trades ({MAX_TRADES}) reached")
+                    send(f"🚫 <b>Max {MAX_TRADES} trades reached for today!</b>")
+                    break
+
+                price = get_live_price(symbol)
+                if price:
+                    open_trade(symbol, price)
+
+        elif is_market_hours():
+            print(f"⏰ Past entry cutoff — monitoring only")
 
         time.sleep(SCAN_MINS * 60)
+
+
+# ══════════════════════════════════════════════════
+#  BACKGROUND — TRAILING SL MONITOR
+# ══════════════════════════════════════════════════
+
+def run_trail_monitor():
+    """Check trailing SL every 1 minute during market hours."""
+    print("📈 Trailing SL monitor started — every 1 min")
+    while True:
+        if is_market_hours() and open_trades:
+            check_all_trades()
+        time.sleep(60)
 
 
 # ══════════════════════════════════════════════════
@@ -172,32 +100,44 @@ def run_scanner():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status"        : "🟢 Running",
-        "scanner"       : f"Every {SCAN_MINS} mins",
-        "market_open"   : is_market_hours(),
-        "last_stocks"   : list(last_stocks)
+        "status"       : "🟢 Running",
+        "mode"         : "🧪 Paper Trading" if PAPER_TRADING else "⚡ Live Trading",
+        "market_open"  : is_market_hours(),
+        "open_trades"  : list(open_trades.keys()),
+        "trades_today" : len(closed_today) + len(open_trades),
+        "max_trades"   : MAX_TRADES
     }), 200
 
 
 @app.route("/test", methods=["GET"])
 def test():
-    send_telegram(
+    send(
         "✅ <b>Bot is Working!</b>\n"
-        "☁️ Running FREE on Cloud\n"
-        f"🔍 Scanning tazbul every {SCAN_MINS} mins\n"
-        "📡 Waiting for market hours (9:15 AM - 3:30 PM IST)"
+        f"🧪 Mode: {'Paper Trading' if PAPER_TRADING else 'Live Trading'}\n"
+        f"💰 Capital: ₹{20000}\n"
+        f"⚠️ Risk/Trade: 1% = ₹200\n"
+        f"🔴 SL: 2% fixed\n"
+        f"🟢 Target: Trailing 2%\n"
+        f"📊 Max Trades: {MAX_TRADES}/day\n"
+        "📡 Scanning: tazbul screener"
     )
     return jsonify({"status": "test sent"}), 200
 
 
-@app.route("/scan-now", methods=["GET"])
-def scan_now():
-    """Manually trigger a scan right now."""
-    stocks = fetch_chartink_screener()
-    if stocks:
-        send_telegram(format_msg(stocks))
-        return jsonify({"status": "alert sent", "stocks": stocks}), 200
-    return jsonify({"status": "no stocks found"}), 200
+@app.route("/status", methods=["GET"])
+def status():
+    summary = get_daily_summary()
+    return jsonify({
+        "open_trades" : list(open_trades.keys()),
+        "summary"     : summary
+    }), 200
+
+
+@app.route("/report", methods=["GET"])
+def report():
+    """Manually trigger daily report."""
+    send_eod_report()
+    return jsonify({"status": "report sent"}), 200
 
 
 # ══════════════════════════════════════════════════
@@ -205,17 +145,21 @@ def scan_now():
 # ══════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    mode = "🧪 PAPER TRADING" if PAPER_TRADING else "⚡ LIVE TRADING"
 
-    # Start background scanner thread
-    scanner = threading.Thread(target=run_scanner, daemon=True)
-    scanner.start()
+    # Start background threads
+    threading.Thread(target=run_scanner,      daemon=True).start()
+    threading.Thread(target=run_trail_monitor, daemon=True).start()
 
-    send_telegram(
-        "🟢 <b>Chartink Bot is LIVE!</b>\n"
-        f"🔍 Auto-scanning <b>tazbul</b> every {SCAN_MINS} mins\n"
-        "⏰ Active: 9:15 AM – 3:30 PM IST\n"
-        "☁️ Running FREE on Render.com"
+    send(
+        f"🟢 <b>Chartink Bot LIVE — {mode}</b>\n"
+        f"💰 Capital  : ₹20,000\n"
+        f"⚠️ Risk     : 1% = ₹200/trade\n"
+        f"🔴 SL       : 2% fixed\n"
+        f"🟢 Target   : 2% trailing\n"
+        f"📊 Max      : {MAX_TRADES} trades/day\n"
+        f"🔍 Scanner  : every {SCAN_MINS} mins\n"
+        f"⏰ Hours    : 9:15 AM – 3:30 PM IST"
     )
 
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
