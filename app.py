@@ -1,7 +1,7 @@
-# app.py — Chartink Paper Trading Bot (Final Fixed Version)
+# app.py — Chartink Paper Trading Bot (Webhook Version)
 from flask import Flask, request, jsonify
 from datetime import datetime, time as dtime
-import pytz, os, time, threading, requests, re, csv
+import pytz, os, time, threading, requests, csv
 
 app = Flask(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -15,14 +15,12 @@ RISK_PERCENT  = float(os.environ.get("RISK_PERCENT", 1.0))
 SL_PERCENT    = float(os.environ.get("SL_PERCENT", 2.0))
 TRAIL_PERCENT = float(os.environ.get("TRAIL_PERCENT", 2.0))
 MAX_TRADES    = int(os.environ.get("MAX_TRADES", 2))
-SCAN_MINS     = int(os.environ.get("SCAN_MINS", 5))
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 PORT          = int(os.environ.get("PORT", 10000))
 
 # ── In-memory store ────────────────────────────────
 open_trades  = {}
 closed_today = []
-last_stocks  = set()
 
 # ══════════════════════════════════════════════════
 #  TELEGRAM
@@ -36,12 +34,9 @@ def send(msg):
             data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=10
         )
-        if r.status_code == 200:
-            print("✅ Telegram sent!")
-        else:
-            print(f"❌ Telegram error: {r.text}")
+        print("✅ Telegram sent!" if r.status_code == 200 else f"❌ {r.text}")
     except Exception as e:
-        print(f"❌ Telegram exception: {e}")
+        print(f"❌ Telegram error: {e}")
 
 
 # ══════════════════════════════════════════════════
@@ -79,84 +74,6 @@ def get_price(symbol):
         print(f"❌ Price error {symbol}: {e}")
         return None
 
-
-# ══════════════════════════════════════════════════
-#  CHARTINK SCANNER
-# ══════════════════════════════════════════════════
-
-def fetch_screener():
-    """Fetch stocks from Chartink screener."""
-    try:
-        scan_clause = os.environ.get("SCAN_CLAUSE", "")
-        xsrf_token  = os.environ.get("XSRF_TOKEN", "")
-
-        if not scan_clause:
-            print("❌ No SCAN_CLAUSE in environment!")
-            return []
-
-        session = requests.Session()
-        headers = {
-            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-            "Accept"          : "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language" : "en-IN,en;q=0.9",
-            "Accept-Encoding" : "gzip, deflate, br",
-            "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "X-Xsrf-Token"    : xsrf_token,
-            "Origin"          : "https://chartink.com",
-            "Referer"         : "https://chartink.com/screener/tazbul",
-            "Connection"      : "keep-alive",
-        }
-
-        # Set XSRF cookie in session
-        session.cookies.set("XSRF-TOKEN", xsrf_token, domain="chartink.com")
-
-        print(f"📋 Scan clause: {scan_clause[:60]}...")
-        print(f"🔑 XSRF token : {xsrf_token[:20]}...")
-
-        # Call screener API
-        resp = session.post(
-            "https://chartink.com/screener/process",
-            data   ={"scan_clause": scan_clause},
-            headers=headers,
-            timeout=20
-        )
-
-        print(f"📡 API status: {resp.status_code}")
-        print(f"📡 Response  : {resp.text[:300]}")
-
-        if resp.status_code != 200:
-            print(f"❌ API failed: {resp.status_code}")
-            return []
-
-        json_data = resp.json()
-        raw_list  = json_data.get("data", [])
-        print(f"📊 Count: {len(raw_list)}")
-
-        if raw_list:
-            print(f"🔍 Sample: {raw_list[0]}")
-
-        # Extract symbols
-        stocks = []
-        for item in raw_list:
-            sym = (
-                item.get("nsecode") or
-                item.get("bsecode") or
-                item.get("symbol")  or
-                item.get("stock_name", "")
-            )
-            if sym:
-                stocks.append(sym.strip().upper())
-
-        print(f"📈 Stocks: {stocks}")
-        return stocks
-
-    except Exception as e:
-        print(f"❌ Screener error: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
 
 # ══════════════════════════════════════════════════
 #  TRADE CALCULATOR
@@ -198,7 +115,6 @@ def calculate(symbol, price):
 
 def open_trade(symbol, price):
     if symbol in open_trades:
-        print(f"⚠️ Already in trade: {symbol}")
         return
     trade = calculate(symbol, price)
     open_trades[symbol] = trade
@@ -222,13 +138,13 @@ def open_trade(symbol, price):
 def close_trade(symbol, exit_price, reason):
     if symbol not in open_trades:
         return
-    trade             = open_trades.pop(symbol)
-    now               = datetime.now(IST).strftime("%d %b %Y %I:%M %p")
+    trade              = open_trades.pop(symbol)
+    now                = datetime.now(IST).strftime("%d %b %Y %I:%M %p")
     trade["exit_time"] = now
-    pnl               = round((exit_price - trade["entry"]) * trade["qty"], 2)
-    icon              = "✅" if pnl >= 0 else "❌"
-    result            = "PROFIT" if pnl >= 0 else "LOSS"
-    mode              = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
+    pnl                = round((exit_price - trade["entry"]) * trade["qty"], 2)
+    icon               = "✅" if pnl >= 0 else "❌"
+    result             = "PROFIT" if pnl >= 0 else "LOSS"
+    mode               = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
 
     send(
         f"{icon} <b>{mode} EXIT — {result}</b>\n"
@@ -275,20 +191,17 @@ def check_trails():
         price = get_price(symbol)
         if not price:
             continue
-
         print(f"📈 {symbol}: ₹{price} | SL: ₹{trade['current_sl']}")
 
-        # SL hit
         if price <= trade["current_sl"]:
             close_trade(symbol, price, "🔴 Stop Loss Hit")
             continue
 
-        # Update trailing SL
         if price > trade["highest"]:
             trade["highest"] = price
             new_sl = round(price * (1 - TRAIL_PERCENT / 100), 2)
             if new_sl > trade["current_sl"]:
-                locked             = round((new_sl - trade["entry"]) * trade["qty"], 2)
+                locked              = round((new_sl - trade["entry"]) * trade["qty"], 2)
                 trade["current_sl"] = new_sl
                 send(
                     f"🔄 <b>TRAILING SL UPDATE</b>\n"
@@ -329,14 +242,12 @@ def send_eod():
 
 
 # ══════════════════════════════════════════════════
-#  BACKGROUND SCANNER
+#  BACKGROUND — TRAILING SL MONITOR
 # ══════════════════════════════════════════════════
 
-def run_scanner():
-    global last_stocks
+def run_trail_monitor():
+    print("📈 Trailing SL monitor started — every 1 min")
     eod_sent = False
-    print(f"🔍 Scanner thread started — every {SCAN_MINS} mins")
-
     while True:
         try:
             t = now_ist()
@@ -351,52 +262,16 @@ def run_scanner():
             # EOD report at 3:30 PM
             if t >= dtime(15, 30) and not eod_sent:
                 send_eod()
-                eod_sent  = True
-                last_stocks = set()
+                eod_sent = True
 
             # Reset next morning
             if t < dtime(9, 0):
                 eod_sent = False
 
-            # Scan for new stocks during entry window
-            if can_enter():
-                print(f"🔍 Scanning... [{datetime.now(IST).strftime('%I:%M %p')}]")
-                stocks     = fetch_screener()
-                new_stocks = [s for s in stocks if s not in last_stocks]
-                last_stocks = set(stocks)
-
-                for sym in new_stocks:
-                    total = len(closed_today) + len(open_trades)
-                    if total >= MAX_TRADES:
-                        send(f"🚫 <b>Max {MAX_TRADES} trades reached today!</b>")
-                        break
-                    price = get_price(sym)
-                    if price:
-                        open_trade(sym, price)
-                    else:
-                        print(f"⚠️ Could not get price for {sym}")
-
-            elif is_market_hours():
-                print(f"⏰ Past entry cutoff — monitoring only")
-            else:
-                print(f"💤 Market closed — waiting [{datetime.now(IST).strftime('%I:%M %p')}]")
-
-        except Exception as e:
-            print(f"❌ Scanner loop error: {e}")
-
-        time.sleep(SCAN_MINS * 60)
-
-
-# ══════════════════════════════════════════════════
-#  TRAILING SL MONITOR THREAD
-# ══════════════════════════════════════════════════
-
-def run_trail_monitor():
-    print("📈 Trailing SL monitor started — every 1 min")
-    while True:
-        try:
+            # Check trailing SL
             if is_market_hours() and open_trades:
                 check_trails()
+
         except Exception as e:
             print(f"❌ Trail monitor error: {e}")
         time.sleep(60)
@@ -405,6 +280,59 @@ def run_trail_monitor():
 # ══════════════════════════════════════════════════
 #  FLASK ROUTES
 # ══════════════════════════════════════════════════
+
+@app.route("/alert", methods=["POST"])
+def receive_alert():
+    """Main webhook endpoint — Chartink posts here."""
+    global closed_today
+
+    if not can_enter():
+        reason = "outside market hours" if not is_market_hours() else "past entry cutoff 2:30 PM"
+        print(f"⏰ Alert ignored: {reason}")
+        return jsonify({"status": "ignored", "reason": reason}), 200
+
+    # Check max trades
+    total = len(closed_today) + len(open_trades)
+    if total >= MAX_TRADES:
+        send(f"🚫 <b>Max {MAX_TRADES} trades reached today!</b>")
+        return jsonify({"status": "max trades reached"}), 200
+
+    # Parse Chartink webhook payload
+    data     = request.json or request.form.to_dict()
+    raw_stk  = data.get("stocks", "")
+    raw_prc  = data.get("trigger_prices", "")
+    screener = data.get("scan_name", "tazbul")
+
+    stocks = [s.strip().upper() for s in raw_stk.split(",") if s.strip()]
+    prices = [p.strip() for p in raw_prc.split(",") if p.strip()]
+
+    print(f"📊 Webhook received: {stocks}")
+
+    if not stocks:
+        return jsonify({"status": "no stocks"}), 400
+
+    # Process each stock
+    for i, sym in enumerate(stocks):
+        total = len(closed_today) + len(open_trades)
+        if total >= MAX_TRADES:
+            break
+
+        # Use webhook price if available, else fetch live
+        if i < len(prices):
+            try:
+                price = round(float(prices[i]), 2)
+            except:
+                price = get_price(sym)
+        else:
+            price = get_price(sym)
+
+        if price:
+            open_trade(sym, price)
+        else:
+            print(f"⚠️ Could not get price for {sym}")
+
+    return jsonify({"status": "ok", "stocks": stocks}), 200
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -430,29 +358,10 @@ def test():
         f"🔴 SL        : {SL_PERCENT}% fixed\n"
         f"🟢 Trailing  : {TRAIL_PERCENT}%\n"
         f"📊 Max Trades: {MAX_TRADES}/day\n"
-        f"🔍 Scanning  : tazbul every {SCAN_MINS} mins\n"
-        f"🕐 Time IST  : {datetime.now(IST).strftime('%I:%M %p')}"
+        f"🕐 Time IST  : {datetime.now(IST).strftime('%I:%M %p')}\n"
+        f"⏰ Market    : {'🟢 Open' if is_market_hours() else '🔴 Closed'}"
     )
     return jsonify({"status": "test sent"}), 200
-
-
-@app.route("/scan-now", methods=["GET"])
-def scan_now():
-    """Manually trigger a scan right now — ignores market hours."""
-    print("🔍 Manual scan triggered!")
-    stocks = fetch_screener()
-    if stocks:
-        send(
-            f"🔍 <b>MANUAL SCAN RESULT</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Screener : tazbul\n"
-            f"📈 Stocks   : {len(stocks)} found\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n".join(f"  📌 <b>{s}</b>" for s in stocks)
-        )
-        return jsonify({"status": "found", "stocks": stocks}), 200
-    send("📭 <b>Manual Scan:</b> No stocks found in tazbul screener")
-    return jsonify({"status": "no stocks"}), 200
 
 
 @app.route("/status", methods=["GET"])
@@ -472,21 +381,21 @@ def report():
 
 
 # ══════════════════════════════════════════════════
-#  START THREADS ON MODULE LOAD
+#  START
 # ══════════════════════════════════════════════════
 
-print("🚀 Starting Chartink Bot...")
-threading.Thread(target=run_scanner,       daemon=True).start()
+print("🚀 Starting Chartink Webhook Bot...")
 threading.Thread(target=run_trail_monitor, daemon=True).start()
+
 send(
-    f"🟢 <b>Chartink Bot LIVE!</b>\n"
+    f"🟢 <b>Chartink Webhook Bot LIVE!</b>\n"
     f"🧪 Mode     : {'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}\n"
     f"💰 Capital  : ₹{CAPITAL}\n"
     f"⚠️ Risk     : {RISK_PERCENT}% = ₹{CAPITAL * RISK_PERCENT / 100}/trade\n"
     f"🔴 SL       : {SL_PERCENT}% fixed\n"
     f"🟢 Trailing : {TRAIL_PERCENT}%\n"
     f"📊 Max      : {MAX_TRADES} trades/day\n"
-    f"🔍 Scanner  : every {SCAN_MINS} mins\n"
+    f"🔗 Webhook  : /alert endpoint ready\n"
     f"⏰ Hours    : 9:15 AM – 3:30 PM IST"
 )
 
