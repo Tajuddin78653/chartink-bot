@@ -85,7 +85,7 @@ def get_price(symbol):
 # ══════════════════════════════════════════════════
 
 def fetch_screener():
-    """Fetch stocks from Chartink screener tazbul."""
+    """Fetch stocks from Chartink screener with login."""
     try:
         session = requests.Session()
         headers = {
@@ -93,61 +93,104 @@ def fetch_screener():
                           "AppleWebKit/537.36 Chrome/91.0 Safari/537.36"
         }
 
-        # Step 1: Load screener page to get CSRF token
-        page = session.get(
-            "https://chartink.com/screener/tazbul",
+        # ── Step 1: Load login page → get CSRF ────
+        login_page = session.get(
+            "https://chartink.com/login",
             headers=headers,
             timeout=15
         )
-
-        # Step 2: Extract CSRF token
         csrf_match = re.search(
-            r'<meta name="csrf-token" content="(.+?)"', page.text
+            r'<meta name="csrf-token" content="(.+?)"',
+            login_page.text
         )
         csrf = csrf_match.group(1) if csrf_match else ""
-        print(f"🔑 CSRF: {csrf[:15]}..." if csrf else "⚠️ No CSRF token!")
+        print(f"🔑 Login CSRF: {csrf[:15]}..." if csrf else "⚠️ No login CSRF!")
 
-        # Step 3: Extract scan clause
-        clause_match = re.search(
-            r'"scan_clause"\s*[=:]\s*["\'](.+?)["\']', page.text
-        )
-        if not clause_match:
-            clause_match = re.search(
-                r'scan_clause.*?value="(.+?)"', page.text
-            )
-        scan_clause = clause_match.group(1) if clause_match else ""
-        print(f"📋 Clause: {scan_clause[:50]}..." if scan_clause else "⚠️ No scan clause!")
+        # ── Step 2: Login to Chartink ──────────────
+        email    = os.environ.get("CHARTINK_EMAIL", "")
+        password = os.environ.get("CHARTINK_PASSWORD", "")
 
-        if not scan_clause:
-            print("❌ Cannot find scan clause — skipping scan")
-            return []
-
-        # Step 4: Call screener API
-        api_headers = {
-            **headers,
-            "X-Csrf-Token"    : csrf,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer"         : "https://chartink.com/screener/tazbul",
-            "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept"          : "application/json, text/javascript, */*"
-        }
-
-        response = session.post(
-            "https://chartink.com/screener/process",
-            data   ={"scan_clause": scan_clause},
-            headers=api_headers,
+        login_resp = session.post(
+            "https://chartink.com/login",
+            data={
+                "_token"  : csrf,
+                "email"   : email,
+                "password": password
+            },
+            headers={
+                **headers,
+                "Referer"     : "https://chartink.com/login",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
             timeout=15
         )
 
-        print(f"📡 API status: {response.status_code}")
-        json_data = response.json()
+        # Check login success
+        if "logout" in login_resp.text.lower() or login_resp.status_code == 200:
+            print("✅ Chartink login successful!")
+        else:
+            print(f"⚠️ Login may have failed: {login_resp.status_code}")
+
+        # ── Step 3: Load screener page ─────────────
+        page = session.get(
+            "https://chartink.com/screener/tazbul",
+            headers={**headers, "Referer": "https://chartink.com/"},
+            timeout=15
+        )
+
+        # ── Step 4: Get fresh CSRF token ───────────
+        csrf_match2 = re.search(
+            r'<meta name="csrf-token" content="(.+?)"',
+            page.text
+        )
+        csrf2 = csrf_match2.group(1) if csrf_match2 else csrf
+        print(f"🔑 Screener CSRF: {csrf2[:15]}...")
+
+        # ── Step 5: Extract scan clause ────────────
+        patterns = [
+            r'"scan_clause"\s*:\s*"(.+?)"',
+            r"'scan_clause'\s*:\s*'(.+?)'",
+            r'scan_clause.*?value="(.+?)"',
+            r'id="scan_clause"[^>]*value="([^"]*)"',
+            r'name="scan_clause"[^>]*value="([^"]*)"'
+        ]
+        scan_clause = ""
+        for pat in patterns:
+            m = re.search(pat, page.text)
+            if m:
+                scan_clause = m.group(1)
+                print(f"📋 Clause found: {scan_clause[:60]}...")
+                break
+
+        if not scan_clause:
+            print("⚠️ Scan clause not found in page!")
+            print(f"📄 Page title: {re.search(r'<title>(.+?)</title>', page.text, re.IGNORECASE)}")
+            return []
+
+        # ── Step 6: Call screener API ──────────────
+        api_resp = session.post(
+            "https://chartink.com/screener/process",
+            data   ={"scan_clause": scan_clause},
+            headers={
+                **headers,
+                "X-Csrf-Token"    : csrf2,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer"         : "https://chartink.com/screener/tazbul",
+                "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept"          : "application/json, text/javascript, */*"
+            },
+            timeout=15
+        )
+
+        print(f"📡 API: {api_resp.status_code}")
+        json_data = api_resp.json()
         raw_list  = json_data.get("data", [])
-        print(f"📊 Raw data count: {len(raw_list)}")
+        print(f"📊 Count: {len(raw_list)}")
 
         if raw_list:
-            print(f"🔍 Sample keys: {list(raw_list[0].keys())}")
+            print(f"🔍 Keys: {list(raw_list[0].keys())}")
 
-        # Step 5: Extract stock symbols
+        # ── Step 7: Extract symbols ────────────────
         stocks = []
         for item in raw_list:
             sym = (
@@ -159,7 +202,7 @@ def fetch_screener():
             if sym:
                 stocks.append(sym.strip().upper())
 
-        print(f"📈 Stocks found: {stocks}")
+        print(f"📈 Stocks: {stocks}")
         return stocks
 
     except Exception as e:
