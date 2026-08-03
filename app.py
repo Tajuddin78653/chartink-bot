@@ -370,28 +370,31 @@ def report():
     return jsonify({"status": "report sent"}), 200
 
 # ══════════════════════════════════════════════════
-#  START BACKGROUND THREADS (runs with gunicorn too)
+#  START
 # ══════════════════════════════════════════════════
 
-# Start scanner thread
-scanner_thread = threading.Thread(target=run_scanner, daemon=True)
-scanner_thread.start()
+def create_app():
+    # Start background threads when app loads
+    t1 = threading.Thread(target=run_scanner, daemon=True)
+    t2 = threading.Thread(target=run_trail_monitor, daemon=True)
+    t1.start()
+    t2.start()
+    print("🚀 Background threads started!")
+    send(
+        f"🟢 <b>Chartink Bot LIVE!</b>\n"
+        f"🧪 Mode     : {'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}\n"
+        f"💰 Capital  : ₹{CAPITAL}\n"
+        f"⚠️ Risk     : {RISK_PERCENT}% = ₹{CAPITAL * RISK_PERCENT / 100}/trade\n"
+        f"🔴 SL       : {SL_PERCENT}% fixed\n"
+        f"🟢 Trailing : {TRAIL_PERCENT}%\n"
+        f"📊 Max      : {MAX_TRADES} trades/day\n"
+        f"🔍 Scanner  : every {SCAN_MINS} mins\n"
+        f"⏰ Hours    : 9:15 AM – 3:30 PM IST"
+    )
+    return app
 
-# Start trailing SL monitor thread
-trail_thread = threading.Thread(target=run_trail_monitor, daemon=True)
-trail_thread.start()
-
-send(
-    f"🟢 <b>Chartink Bot LIVE!</b>\n"
-    f"🧪 Mode     : {'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}\n"
-    f"💰 Capital  : ₹{CAPITAL}\n"
-    f"⚠️ Risk     : {RISK_PERCENT}% = ₹{CAPITAL * RISK_PERCENT / 100}/trade\n"
-    f"🔴 SL       : {SL_PERCENT}% fixed\n"
-    f"🟢 Trailing : {TRAIL_PERCENT}%\n"
-    f"📊 Max      : {MAX_TRADES} trades/day\n"
-    f"🔍 Scanner  : every {SCAN_MINS} mins\n"
-    f"⏰ Hours    : 9:15 AM – 3:30 PM IST"
-)
+# Initialize on module load (works with both gunicorn and python)
+create_app()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
