@@ -85,96 +85,85 @@ def get_price(symbol):
 # ══════════════════════════════════════════════════
 
 def fetch_screener():
-    """Fetch stocks from Chartink screener using direct API."""
+    """Fetch stocks from Chartink screener."""
     try:
         session = requests.Session()
         headers = {
             "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
             "Accept"         : "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Language": "en-IN,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection"     : "keep-alive",
         }
 
-        # ── Step 1: Load screener page ─────────────
+        # ── Step 1: Hit homepage first to get cookies ──
+        session.get("https://chartink.com", headers=headers, timeout=15)
+
+        # ── Step 2: Load screener page ─────────────────
         page = session.get(
             "https://chartink.com/screener/tazbul",
-            headers=headers,
+            headers={**headers, "Referer": "https://chartink.com/"},
             timeout=15
         )
         print(f"📄 Page status: {page.status_code}")
 
-        # ── Step 2: Get CSRF token ─────────────────
-        csrf_match = re.search(
-            r'<meta name="csrf-token" content="(.+?)"',
-            page.text
-        )
-        csrf = csrf_match.group(1) if csrf_match else ""
-        print(f"🔑 CSRF: {csrf[:20]}..." if csrf else "⚠️ No CSRF!")
+        # ── Step 3: Get CSRF from cookies ──────────────
+        csrf = ""
 
-        # ── Step 3: Find scan clause (all patterns) ─
-        scan_clause = ""
+        # Try cookies first (most reliable)
+        for cookie in session.cookies:
+            if "csrf" in cookie.name.lower() or "xsrf" in cookie.name.lower():
+                csrf = cookie.value
+                print(f"🔑 CSRF from cookie: {csrf[:20]}...")
+                break
 
-        # Pattern 1: JavaScript variable
-        m = re.search(r'var\s+scan_clause\s*=\s*["\'](.+?)["\']', page.text)
-        if m:
-            scan_clause = m.group(1)
-            print(f"✅ Pattern 1: {scan_clause[:50]}")
+        # Try XSRF-TOKEN cookie specifically
+        if not csrf:
+            csrf = session.cookies.get("XSRF-TOKEN", "")
+            if csrf:
+                from urllib.parse import unquote
+                csrf = unquote(csrf)
+                print(f"🔑 CSRF from XSRF-TOKEN: {csrf[:20]}...")
 
-        # Pattern 2: JSON format
-        if not scan_clause:
-            m = re.search(r'"scan_clause"\s*:\s*"(.+?)"', page.text)
+        # Try meta tag
+        if not csrf:
+            m = re.search(r'<meta name="csrf-token" content="(.+?)"', page.text)
             if m:
-                scan_clause = m.group(1)
-                print(f"✅ Pattern 2: {scan_clause[:50]}")
+                csrf = m.group(1)
+                print(f"🔑 CSRF from meta: {csrf[:20]}...")
 
-        # Pattern 3: Input field
-        if not scan_clause:
-            m = re.search(r'id=["\']scan_clause["\'][^>]*value=["\']([^"\']*)["\']', page.text)
+        # Try from page scripts
+        if not csrf:
+            m = re.search(r'"csrfToken"\s*:\s*"(.+?)"', page.text)
             if m:
-                scan_clause = m.group(1)
-                print(f"✅ Pattern 3: {scan_clause[:50]}")
+                csrf = m.group(1)
+                print(f"🔑 CSRF from script: {csrf[:20]}...")
 
-        # Pattern 4: Textarea
-        if not scan_clause:
-            m = re.search(r'name=["\']scan_clause["\'][^>]*>([^<]+)<', page.text)
-            if m:
-                scan_clause = m.group(1).strip()
-                print(f"✅ Pattern 4: {scan_clause[:50]}")
+        if not csrf:
+            print("⚠️ No CSRF found anywhere!")
+            print(f"🍪 All cookies: {[c.name for c in session.cookies]}")
 
-        # Pattern 5: data attribute
-        if not scan_clause:
-            m = re.search(r'data-scan=["\'](.+?)["\']', page.text)
-            if m:
-                scan_clause = m.group(1)
-                print(f"✅ Pattern 5: {scan_clause[:50]}")
+        # ── Step 4: Get scan clause ────────────────────
+        scan_clause = os.environ.get("SCAN_CLAUSE", "")
+        if scan_clause:
+            print(f"📋 Using env clause: {scan_clause[:60]}...")
+        else:
+            print("❌ No SCAN_CLAUSE in environment!")
+            return []
 
-        # ── Step 4: If no scan clause found ────────
-        if not scan_clause:
-            print("⚠️ Scan clause not found — trying saved clause")
-            # Use hardcoded scan from your screener
-            # Go to chartink.com/screener/tazbul
-            # Press F12 → Network tab → look for 'process' POST request
-            # Copy the scan_clause value and paste here
-            scan_clause = os.environ.get("SCAN_CLAUSE", "")
-            if not scan_clause:
-                print("❌ No scan clause available!")
-                # Debug: save page snippet
-                print(f"📄 Page snippet: {page.text[5000:5500]}")
-                return []
-
-        print(f"📋 Using clause: {scan_clause[:80]}...")
-
-        # ── Step 5: Call screener process API ──────
+        # ── Step 5: Call API with proper headers ───────
         api_headers = {
-            **headers,
-            "X-Csrf-Token"    : csrf,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer"         : "https://chartink.com/screener/tazbul",
-            "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent"      : headers["User-Agent"],
             "Accept"          : "application/json, text/javascript, */*; q=0.01",
-            "Origin"          : "https://chartink.com"
+            "Accept-Language" : "en-IN,en;q=0.9",
+            "Accept-Encoding" : "gzip, deflate, br",
+            "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Csrf-Token"    : csrf,
+            "Origin"          : "https://chartink.com",
+            "Referer"         : "https://chartink.com/screener/tazbul",
+            "Connection"      : "keep-alive",
         }
 
         api_resp = session.post(
@@ -185,14 +174,21 @@ def fetch_screener():
         )
 
         print(f"📡 API status: {api_resp.status_code}")
-        print(f"📡 Response: {api_resp.text[:200]}")
+        print(f"📡 Response preview: {api_resp.text[:300]}")
+
+        if api_resp.status_code == 419:
+            print("❌ CSRF mismatch — trying with cookie value directly")
+            # Try with Laravel session token
+            laravel_token = session.cookies.get("laravel_session", "")
+            print(f"🍪 Laravel session: {laravel_token[:20] if laravel_token else 'Not found'}")
+            return []
 
         json_data = api_resp.json()
         raw_list  = json_data.get("data", [])
-        print(f"📊 Stocks count: {len(raw_list)}")
+        print(f"📊 Count: {len(raw_list)}")
 
         if raw_list:
-            print(f"🔍 Sample: {raw_list[0]}")
+            print(f"🔍 Sample item: {raw_list[0]}")
 
         # Extract symbols
         stocks = []
@@ -206,7 +202,7 @@ def fetch_screener():
             if sym:
                 stocks.append(sym.strip().upper())
 
-        print(f"📈 Final stocks: {stocks}")
+        print(f"📈 Stocks found: {stocks}")
         return stocks
 
     except Exception as e:
