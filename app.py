@@ -152,6 +152,12 @@ def fetch_screener():
             print("❌ No SCAN_CLAUSE in environment!")
             return []
 
+        # Also try hardcoded CSRF from environment
+        if not csrf:
+            csrf = os.environ.get("CSRF_TOKEN", "")
+            if csrf:
+                print(f"🔑 CSRF from env: {csrf[:20]}...")
+        
         # ── Step 5: Call API with proper headers ───────
         api_headers = {
             "User-Agent"      : headers["User-Agent"],
