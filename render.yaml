@@ -1,1 +1,25 @@
-startCommand: gunicorn --worker-class=gthread --workers=1 --threads=4 --bind 0.0.0.0:$PORT app:app
+services:
+  - type: web
+    name: chartink-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class=gthread --workers=1 --threads=4 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: PAPER_TRADING
+        value: "true"
+      - key: CAPITAL
+        value: "20000"
+      - key: RISK_PERCENT
+        value: "1"
+      - key: SL_PERCENT
+        value: "2"
+      - key: TRAIL_PERCENT
+        value: "2"
+      - key: MAX_TRADES
+        value: "2"
+      - key: SCAN_MINS
+        value: "5"
