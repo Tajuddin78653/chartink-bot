@@ -202,7 +202,11 @@ def fetch_screener():
                      "Referer": "https://chartink.com/screener/tazbul"},
             timeout=15
         )
-        stocks = [i["nsecode"] for i in r.json().get("data", [])]
+        data_list = r.json().get("data", [])
+# Try nsecode first, fallback to symbol for futures
+stocks = [i.get("nsecode") or i.get("symbol") or i.get("stock_name", "") 
+          for i in data_list if i.get("nsecode") or i.get("symbol")]
+print(f"📊 Raw data sample: {data_list[:2] if data_list else 'Empty'}")
         print(f"📊 Screener: {stocks}")
         return stocks
     except Exception as e:
