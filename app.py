@@ -87,114 +87,55 @@ def get_price(symbol):
 def fetch_screener():
     """Fetch stocks from Chartink screener."""
     try:
-        session = requests.Session()
-        headers = {
-            "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-            "Accept"         : "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-IN,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection"     : "keep-alive",
-        }
-
-        # ── Step 1: Hit homepage first to get cookies ──
-        session.get("https://chartink.com", headers=headers, timeout=15)
-
-        # ── Step 2: Load screener page ─────────────────
-        page = session.get(
-            "https://chartink.com/screener/tazbul",
-            headers={**headers, "Referer": "https://chartink.com/"},
-            timeout=15
-        )
-        print(f"📄 Page status: {page.status_code}")
-
-        # ── Step 3: Get CSRF from cookies ──────────────
-        csrf = ""
-
-        # Try cookies first (most reliable)
-        for cookie in session.cookies:
-            if "csrf" in cookie.name.lower() or "xsrf" in cookie.name.lower():
-                csrf = cookie.value
-                print(f"🔑 CSRF from cookie: {csrf[:20]}...")
-                break
-
-        # Try XSRF-TOKEN cookie specifically
-        if not csrf:
-            csrf = session.cookies.get("XSRF-TOKEN", "")
-            if csrf:
-                from urllib.parse import unquote
-                csrf = unquote(csrf)
-                print(f"🔑 CSRF from XSRF-TOKEN: {csrf[:20]}...")
-
-        # Try meta tag
-        if not csrf:
-            m = re.search(r'<meta name="csrf-token" content="(.+?)"', page.text)
-            if m:
-                csrf = m.group(1)
-                print(f"🔑 CSRF from meta: {csrf[:20]}...")
-
-        # Try from page scripts
-        if not csrf:
-            m = re.search(r'"csrfToken"\s*:\s*"(.+?)"', page.text)
-            if m:
-                csrf = m.group(1)
-                print(f"🔑 CSRF from script: {csrf[:20]}...")
-
-        if not csrf:
-            print("⚠️ No CSRF found anywhere!")
-            print(f"🍪 All cookies: {[c.name for c in session.cookies]}")
-
-        # ── Step 4: Get scan clause ────────────────────
         scan_clause = os.environ.get("SCAN_CLAUSE", "")
-        if scan_clause:
-            print(f"📋 Using env clause: {scan_clause[:60]}...")
-        else:
+        xsrf_token  = os.environ.get("XSRF_TOKEN", "")
+
+        if not scan_clause:
             print("❌ No SCAN_CLAUSE in environment!")
             return []
 
-        # Also try hardcoded CSRF from environment
-        if not csrf:
-            csrf = os.environ.get("CSRF_TOKEN", "")
-            if csrf:
-                print(f"🔑 CSRF from env: {csrf[:20]}...")
-        
-        # ── Step 5: Call API with proper headers ───────
-        api_headers = {
-            "User-Agent"      : headers["User-Agent"],
+        session = requests.Session()
+        headers = {
+            "User-Agent"      : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
             "Accept"          : "application/json, text/javascript, */*; q=0.01",
             "Accept-Language" : "en-IN,en;q=0.9",
             "Accept-Encoding" : "gzip, deflate, br",
             "Content-Type"    : "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
-            "X-Csrf-Token"    : csrf,
+            "X-Xsrf-Token"    : xsrf_token,
             "Origin"          : "https://chartink.com",
             "Referer"         : "https://chartink.com/screener/tazbul",
             "Connection"      : "keep-alive",
         }
 
-        api_resp = session.post(
+        # Set XSRF cookie in session
+        session.cookies.set("XSRF-TOKEN", xsrf_token, domain="chartink.com")
+
+        print(f"📋 Scan clause: {scan_clause[:60]}...")
+        print(f"🔑 XSRF token : {xsrf_token[:20]}...")
+
+        # Call screener API
+        resp = session.post(
             "https://chartink.com/screener/process",
             data   ={"scan_clause": scan_clause},
-            headers=api_headers,
+            headers=headers,
             timeout=20
         )
 
-        print(f"📡 API status: {api_resp.status_code}")
-        print(f"📡 Response preview: {api_resp.text[:300]}")
+        print(f"📡 API status: {resp.status_code}")
+        print(f"📡 Response  : {resp.text[:300]}")
 
-        if api_resp.status_code == 419:
-            print("❌ CSRF mismatch — trying with cookie value directly")
-            # Try with Laravel session token
-            laravel_token = session.cookies.get("laravel_session", "")
-            print(f"🍪 Laravel session: {laravel_token[:20] if laravel_token else 'Not found'}")
+        if resp.status_code != 200:
+            print(f"❌ API failed: {resp.status_code}")
             return []
 
-        json_data = api_resp.json()
+        json_data = resp.json()
         raw_list  = json_data.get("data", [])
         print(f"📊 Count: {len(raw_list)}")
 
         if raw_list:
-            print(f"🔍 Sample item: {raw_list[0]}")
+            print(f"🔍 Sample: {raw_list[0]}")
 
         # Extract symbols
         stocks = []
@@ -208,7 +149,7 @@ def fetch_screener():
             if sym:
                 stocks.append(sym.strip().upper())
 
-        print(f"📈 Stocks found: {stocks}")
+        print(f"📈 Stocks: {stocks}")
         return stocks
 
     except Exception as e:
@@ -216,7 +157,6 @@ def fetch_screener():
         import traceback
         traceback.print_exc()
         return []
-
 
 # ══════════════════════════════════════════════════
 #  TRADE CALCULATOR
