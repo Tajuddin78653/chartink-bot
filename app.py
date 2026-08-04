@@ -464,14 +464,10 @@ def receive_alert():
         )
         return jsonify({"status": "too early"}), 200
 
-    if t > dtime(9, 16, 59):
-        send(
-            f"⏰ <b>Alert received after entry window!</b>\n"
-            f"🕐 Time: {time_str()}\n"
-            f"📌 Stocks: {', '.join(stocks)}\n"
-            f"⚠️ Entry window: 9:16 AM only"
-        )
-        return jsonify({"status": "outside entry window"}), 200
+        # ── Check market hours ─────────────────────
+        if not (dtime(9, 15) <= t <= dtime(14, 30)):
+            print(f"⏰ Alert outside trading hours: {t}")
+            return jsonify({"status": "outside trading hours"}), 200
 
     # ── Process each stock at 9:16 AM ─────────────
     results = []
@@ -548,8 +544,8 @@ def test():
         f"📊 Max Positions : {MAX_POSITIONS}\n"
         f"🔴 Stop Loss     : {SL_PERCENT}%\n"
         f"🟢 Target        : {TARGET_PERCENT}% (1:2 RR)\n"
-        f"⏰ Entry Window  : 9:16 AM only\n"
-        f"📈 Entry Filter  : Strong bullish 9:15 candle\n"
+        f"⏰ Entry Hours   : 9:15 AM – 2:30 PM\n"
+        f"📈 Entry Filter  : 9:15 candle strong bullish\n"
         f"🚪 Force Exit    : 3:12 PM\n"
         f"🕐 Current Time  : {time_str()}"
     )
@@ -592,8 +588,8 @@ send(
     f"📊 Max Positions : {MAX_POSITIONS}\n"
     f"🔴 Stop Loss     : {SL_PERCENT}%\n"
     f"🟢 Target        : {TARGET_PERCENT}% (1:2 RR)\n"
-    f"⏰ Entry Window  : 9:16 AM ONLY\n"
-    f"📈 Entry Filter  : Strong bullish 9:15 candle\n"
+    f"⏰ Entry Hours   : 9:15 AM – 2:30 PM\n"
+    f"📈 Entry Filter  : 9:15 candle strong bullish\n"
     f"🚪 Force Exit    : 3:12 PM\n"
     f"⏰ Market Hours  : 9:15 AM – 3:30 PM IST"
 )
