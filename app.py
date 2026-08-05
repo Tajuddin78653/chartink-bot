@@ -371,41 +371,44 @@ def receive_alert():
         return jsonify({"status": "no stocks"}), 400
 
     t = now_ist()
+    print(f"📊 Alert at {t}: {stocks}")
+
     if not can_enter():
-        print(f"⏰ Outside entry hours: {t}")
         return jsonify({"status": "outside entry hours"}), 200
 
     results = []
     for i, symbol in enumerate(stocks):
+
         if len(open_trades) >= MAX_POSITIONS:
             send(f"🚫 <b>Max {MAX_POSITIONS} positions reached!</b>")
             break
+
         if symbol in open_trades:
             continue
 
-      # ── Check 9:15 candle ONLY at 9:15-9:16 AM ──
-t = now_ist()
-is_opening_alert = dtime(9, 15) <= t <= dtime(9, 16, 59)
+        # Only check 9:15 candle if alert is at 9:15-9:16 AM
+        is_opening = dtime(9, 15) <= t <= dtime(9, 16, 59)
+        candle_info = ""
 
-if is_opening_alert:
-    candle = get_915_candle(symbol)
-    is_bullish, candle_info = is_strong_bullish_candle(candle)
-    if not is_bullish:
-        send(
-            f"❌ <b>Entry REJECTED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 9:15 Candle: {candle_info}\n"
-            f"⚠️ Need strong bullish candle\n"
-            f"🕐 {time_str()}"
-        )
-        results.append({"symbol": symbol, "status": "rejected"})
-        continue
-    candle_info = f"✅ {candle_info}"
-else:
-    candle_info = f"⏰ Alert at {t.strftime('%I:%M %p')} — direct entry"
-    
+        if is_opening:
+            candle = get_915_candle(symbol)
+            is_bullish, candle_info = is_strong_bullish_candle(candle)
+            if not is_bullish:
+                send(
+                    f"❌ <b>Entry REJECTED — {symbol}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 9:15 Candle: {candle_info}\n"
+                    f"⚠️ Need strong bullish candle\n"
+                    f"🕐 {time_str()}"
+                )
+                results.append({"symbol": symbol, "status": "rejected"})
+                continue
+            candle_info = f"✅ {candle_info}"
+        else:
+            candle_info = f"Direct entry at {t.strftime('%I:%M %p')}"
+
         chartink_price = prices[i] if i < len(prices) else None
-        price          = get_price(symbol, chartink_price)
+        price = get_price(symbol, chartink_price)
 
         if not price:
             send(f"❌ Could not fetch price for {symbol}")
