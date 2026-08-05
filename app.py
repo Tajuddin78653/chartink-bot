@@ -230,7 +230,7 @@ def is_strong_bullish_candle(candle):
 # ══════════════════════════════════════════════════
 
 def calculate(symbol, price):
-    sl_price     = round(price * (1 -  / 100), 2)
+    sl_price     = round(price * (1 - SL_PERCENT / 100), 2)
     target_price = round(price * (1 + TARGET_PERCENT / 100), 2)
     sl_distance  = round(price - sl_price, 2)
     qty          = max(1, int(CAPITAL_PER_TRADE / price))
