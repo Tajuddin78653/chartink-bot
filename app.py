@@ -15,8 +15,8 @@ CHAT_ID       = os.environ.get("CHAT_ID", "")
 CAPITAL       = float(os.environ.get("CAPITAL", 20000))
 CAPITAL_PER_TRADE = 10000          # Fixed ₹10,000 per trade
 RISK_PERCENT  = float(os.environ.get("RISK_PERCENT", 1.0))
-SL_PERCENT    = float(os.environ.get("SL_PERCENT", 2.0))
-TARGET_PERCENT= SL_PERCENT * 2     # 1:2 Risk Reward = 4%
+SL_PERCENT    = float(os.environ.get("SL_PERCENT", 1.0))
+TARGET_PERCENT= SL_PERCENT * 1     # 1:2 Risk Reward = 4%
 MAX_POSITIONS = 10                 # Max 10 positions
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 PORT          = int(os.environ.get("PORT", 10000))
@@ -230,7 +230,7 @@ def is_strong_bullish_candle(candle):
 # ══════════════════════════════════════════════════
 
 def calculate(symbol, price):
-    sl_price     = round(price * (1 - SL_PERCENT / 100), 2)
+    sl_price     = round(price * (1 -  / 100), 2)
     target_price = round(price * (1 + TARGET_PERCENT / 100), 2)
     sl_distance  = round(price - sl_price, 2)
     qty          = max(1, int(CAPITAL_PER_TRADE / price))
@@ -277,7 +277,7 @@ def open_trade(symbol, price, candle_info=""):
         f"📌 Stock     : <b>{symbol}</b>\n"
         f"💰 Entry     : ₹{price}\n"
         f"📦 Quantity  : {trade['qty']} shares\n"
-        f"🔴 Stop Loss : ₹{trade['sl']} ({SL_PERCENT}%)\n"
+        f"🔴 Stop Loss : ₹{trade['sl']} ({}%)\n"
         f"🟢 Target    : ₹{trade['target']} ({TARGET_PERCENT}%)\n"
         f"📊 R:R       : 1:2\n"
         f"💵 Capital   : ₹{trade['capital_used']}\n"
@@ -527,9 +527,9 @@ def home():
         "max_positions" : MAX_POSITIONS,
         "trades_today"  : len(closed_today) + len(open_trades),
         "capital_per_trade": CAPITAL_PER_TRADE,
-        "sl_percent"    : SL_PERCENT,
+        ""    : ,
         "target_percent": TARGET_PERCENT,
-        "rr_ratio"      : "1:2",
+        "rr_ratio"      : "1:1",
         "force_exit"    : "3:12 PM",
     }), 200
 
@@ -542,7 +542,7 @@ def test():
         f"🧪 Mode          : {'Paper Trading' if PAPER_TRADING else 'Live Trading'}\n"
         f"💰 Capital/Trade : ₹{CAPITAL_PER_TRADE}\n"
         f"📊 Max Positions : {MAX_POSITIONS}\n"
-        f"🔴 Stop Loss     : {SL_PERCENT}%\n"
+        f"🔴 Stop Loss     : {}%\n"
         f"🟢 Target        : {TARGET_PERCENT}% (1:2 RR)\n"
         f"⏰ Entry Hours   : 9:15 AM – 2:30 PM\n"
         f"📈 Entry Filter  : 9:15 candle strong bullish\n"
@@ -586,7 +586,7 @@ send(
     f"🧪 Mode          : {'PAPER TRADING' if PAPER_TRADING else 'LIVE TRADING'}\n"
     f"💰 Capital/Trade : ₹{CAPITAL_PER_TRADE}\n"
     f"📊 Max Positions : {MAX_POSITIONS}\n"
-    f"🔴 Stop Loss     : {SL_PERCENT}%\n"
+    f"🔴 Stop Loss     : {}%\n"
     f"🟢 Target        : {TARGET_PERCENT}% (1:2 RR)\n"
     f"⏰ Entry Hours   : 9:15 AM – 2:30 PM\n"
     f"📈 Entry Filter  : 9:15 candle strong bullish\n"
