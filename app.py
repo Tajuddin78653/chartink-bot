@@ -37,6 +37,11 @@ open_trades2  = {}
 closed_today2 = []
 traded_today2 = set()
 
+# ── NSE cache (refresh every 60s) ─────────────
+_nse_cache      = {}
+_nse_cache_time = 0
+NSE_CACHE_TTL   = 60   # seconds
+
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
@@ -139,6 +144,146 @@ def log_trade(trade, exit_price, pnl, reason, logfile):
             pnl, "WIN" if pnl >= 0 else "LOSS",
             reason, trade["entry_time"], trade["exit_time"]
         ])
+
+# ─────────────────────────────────────────────
+#  NSE DATA FETCHER
+# ─────────────────────────────────────────────
+def _nse_session():
+    """Create an NSE session with required cookies."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept"         : "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer"        : "https://www.nseindia.com/",
+    })
+    try:
+        s.get("https://www.nseindia.com", timeout=10)
+    except:
+        pass
+    return s
+
+def fetch_nse_data():
+    """Fetch pre-open data, advances/declines, and sector volumes from NSE.
+    Returns a dict with keys: preopen, advances, declines, unchanged, sectors, fetched_at, error
+    Results are cached for NSE_CACHE_TTL seconds."""
+    global _nse_cache, _nse_cache_time
+    now_ts = time.time()
+    if _nse_cache and (now_ts - _nse_cache_time) < NSE_CACHE_TTL:
+        return _nse_cache
+
+    result = {
+        "preopen"   : [],
+        "advances"  : 0,
+        "declines"  : 0,
+        "unchanged" : 0,
+        "sectors"   : [],
+        "fetched_at": time_str(),
+        "error"     : None,
+    }
+
+    try:
+        s = _nse_session()
+
+        # ── 1. Pre-open data (Nifty 50) ──────────────────────────
+        try:
+            r = s.get(
+                "https://www.nseindia.com/api/market-data-pre-open?key=NIFTY",
+                timeout=12)
+            data = r.json()
+            raw  = data.get("data", [])
+            # Sort by absolute % change descending, take top 10
+            def pct(item):
+                try:
+                    return abs(float(item.get("metadata", {}).get("pChange", 0)))
+                except:
+                    return 0
+            top10 = sorted(raw, key=pct, reverse=True)[:10]
+            for item in top10:
+                m = item.get("metadata", {})
+                result["preopen"].append({
+                    "symbol" : m.get("symbol", ""),
+                    "ltp"    : m.get("lastPrice", 0),
+                    "change" : round(float(m.get("change", 0)), 2),
+                    "pchange": round(float(m.get("pChange", 0)), 2),
+                    "volume" : m.get("totalTradedVolume", 0),
+                    "iep"    : m.get("iep", 0),   # Indicative Equilibrium Price
+                })
+        except Exception as e:
+            result["error"] = f"Pre-open fetch failed: {e}"
+
+        # ── 2. Advances / Declines (Nifty 50 index) ──────────────
+        try:
+            r2  = s.get(
+                "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050",
+                timeout=12)
+            idx = r2.json()
+            adv = dec = unc = 0
+            for stock in idx.get("data", []):
+                try:
+                    chg = float(stock.get("pChange", 0))
+                    if chg > 0:
+                        adv += 1
+                    elif chg < 0:
+                        dec += 1
+                    else:
+                        unc += 1
+                except:
+                    pass
+            result["advances"]  = adv
+            result["declines"]  = dec
+            result["unchanged"] = unc
+        except Exception as e:
+            if not result["error"]:
+                result["error"] = f"Adv/Dec fetch failed: {e}"
+
+        # ── 3. Sector volumes ─────────────────────────────────────
+        SECTORS = {
+            "NIFTY IT"       : "NIFTY%20IT",
+            "NIFTY BANK"     : "NIFTY%20BANK",
+            "NIFTY AUTO"     : "NIFTY%20AUTO",
+            "NIFTY PHARMA"   : "NIFTY%20PHARMA",
+            "NIFTY FMCG"     : "NIFTY%20FMCG",
+            "NIFTY METAL"    : "NIFTY%20METAL",
+            "NIFTY ENERGY"   : "NIFTY%20ENERGY",
+            "NIFTY REALTY"   : "NIFTY%20REALTY",
+        }
+        sector_vols = []
+        for name, key in SECTORS.items():
+            try:
+                rs = s.get(
+                    f"https://www.nseindia.com/api/equity-stockIndices?index={key}",
+                    timeout=10)
+                jd = rs.json()
+                total_vol = sum(
+                    int(stock.get("totalTradedVolume", 0) or 0)
+                    for stock in jd.get("data", [])
+                )
+                # index-level pChange is in the first item (metadata row) if available
+                idx_pchange = 0
+                meta_row = jd.get("metadata", {})
+                if meta_row:
+                    try:
+                        idx_pchange = round(float(meta_row.get("pChange", 0)), 2)
+                    except:
+                        pass
+                sector_vols.append({
+                    "name"    : name,
+                    "volume"  : total_vol,
+                    "pchange" : idx_pchange,
+                })
+            except:
+                pass
+        sector_vols.sort(key=lambda x: x["volume"], reverse=True)
+        result["sectors"] = sector_vols
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    result["fetched_at"] = time_str()
+    _nse_cache      = result
+    _nse_cache_time = time.time()
+    return result
 
 # ─────────────────────────────────────────────
 #  BOT 1 — tazbul
@@ -404,6 +549,11 @@ def receive_alert2():
         results.append({"symbol": symbol, "status": "entered", "price": price})
     return jsonify({"status": "processed", "results": results}), 200
 
+@app.route("/nse-data", methods=["GET"])
+def nse_data_api():
+    """Returns NSE pre-open, advances/declines and sector volume as JSON."""
+    return jsonify(fetch_nse_data()), 200
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -469,7 +619,7 @@ def status():
     }), 200
 
 # ─────────────────────────────────────────────
-#  DASHBOARD
+#  DASHBOARD HELPERS
 # ─────────────────────────────────────────────
 def build_table_rows(trades_dict):
     rows = ""
@@ -543,9 +693,97 @@ def stats(today_closed):
     win_rate     = round((len(winners) / len(today_closed) * 100) if today_closed else 0, 1)
     return winners, losers, net_pnl, gross_profit, gross_loss, win_rate
 
+# ─────────────────────────────────────────────
+#  NSE HTML BUILDERS
+# ─────────────────────────────────────────────
+def build_preopen_rows(preopen):
+    if not preopen:
+        return '<tr><td colspan="5" style="text-align:center;color:#8b949e;padding:24px;">No pre-open data available — market may be closed or NSE blocked the request</td></tr>'
+    rows = ""
+    for s in preopen:
+        pct  = float(s.get("pchange", 0))
+        col  = "#00c896" if pct >= 0 else "#ff4d4d"
+        sign = "+" if pct >= 0 else ""
+        vol  = s.get("volume", 0)
+        try:
+            vol_fmt = f"{int(vol):,}"
+        except:
+            vol_fmt = str(vol)
+        rows += f"""<tr>
+          <td><b>{s['symbol']}</b></td>
+          <td>&#8377;{s.get('iep', s.get('ltp', 0))}</td>
+          <td>&#8377;{s.get('ltp', 0)}</td>
+          <td style="color:{col};font-weight:700;">{sign}{pct}%</td>
+          <td>{vol_fmt}</td>
+        </tr>"""
+    return rows
+
+def build_sector_rows(sectors):
+    if not sectors:
+        return '<tr><td colspan="3" style="text-align:center;color:#8b949e;padding:24px;">No sector data available</td></tr>'
+    rows = ""
+    max_vol = max((s["volume"] for s in sectors), default=1) or 1
+    for s in sectors:
+        pct  = float(s.get("pchange", 0))
+        col  = "#00c896" if pct >= 0 else "#ff4d4d"
+        sign = "+" if pct >= 0 else ""
+        bar_w = int(s["volume"] / max_vol * 100)
+        try:
+            vol_fmt = f"{int(s['volume']):,}"
+        except:
+            vol_fmt = str(s["volume"])
+        rows += f"""<tr>
+          <td><b>{s['name']}</b></td>
+          <td>
+            <div style="background:#21262d;border-radius:4px;height:14px;width:160px;overflow:hidden;">
+              <div style="background:#58a6ff;height:100%;width:{bar_w}%;"></div>
+            </div>
+            <span style="font-size:11px;color:#8b949e;">{vol_fmt}</span>
+          </td>
+          <td style="color:{col};font-weight:700;">{sign}{pct}%</td>
+        </tr>"""
+    return rows
+
+def build_adv_dec_html(adv, dec, unc):
+    total  = adv + dec + unc or 1
+    adv_w  = int(adv / total * 100)
+    dec_w  = int(dec / total * 100)
+    unc_w  = 100 - adv_w - dec_w
+    return f"""
+    <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;margin-bottom:16px;">
+      <div class="stat-card" style="flex:1;min-width:120px;">
+        <div class="stat-label">&#9650; Advances</div>
+        <div class="stat-value" style="color:#00c896;">{adv}</div>
+      </div>
+      <div class="stat-card" style="flex:1;min-width:120px;">
+        <div class="stat-label">&#9660; Declines</div>
+        <div class="stat-value" style="color:#ff4d4d;">{dec}</div>
+      </div>
+      <div class="stat-card" style="flex:1;min-width:120px;">
+        <div class="stat-label">&#8213; Unchanged</div>
+        <div class="stat-value" style="color:#8b949e;">{unc}</div>
+      </div>
+      <div style="flex:3;min-width:200px;">
+        <div style="font-size:11px;color:#8b949e;margin-bottom:6px;">Market Breadth — Nifty 50</div>
+        <div style="display:flex;border-radius:6px;overflow:hidden;height:20px;">
+          <div style="width:{adv_w}%;background:#00c896;" title="Advances {adv}"></div>
+          <div style="width:{unc_w}%;background:#8b949e;" title="Unchanged {unc}"></div>
+          <div style="width:{dec_w}%;background:#ff4d4d;" title="Declines {dec}"></div>
+        </div>
+        <div style="display:flex;gap:16px;font-size:11px;color:#8b949e;margin-top:4px;">
+          <span style="color:#00c896;">&#9650; {adv_w}% Adv</span>
+          <span>&#8213; {unc_w}% Unch</span>
+          <span style="color:#ff4d4d;">&#9660; {dec_w}% Dec</span>
+        </div>
+      </div>
+    </div>"""
+
+# ─────────────────────────────────────────────
+#  DASHBOARD
+# ─────────────────────────────────────────────
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    today_str  = datetime.now(IST).strftime("%Y-%m-%d")
     mode_label = "🧪 Paper Trading" if PAPER_TRADING else "⚡ Live Trading"
     mkt_status = "🟢 Market Open" if is_market_hours() else "🔴 Market Closed"
 
@@ -565,6 +803,14 @@ def dashboard():
     closed_rows2  = build_closed_rows(today2)
     history_rows2 = build_history_rows(hist2)
 
+    # ── NSE Market data ───────────────────────
+    nse        = fetch_nse_data()
+    preopen_r  = build_preopen_rows(nse["preopen"])
+    sector_r   = build_sector_rows(nse["sectors"])
+    adv_dec_h  = build_adv_dec_html(nse["advances"], nse["declines"], nse["unchanged"])
+    nse_err    = nse.get("error") or ""
+    nse_time   = nse.get("fetched_at", "")
+
     pnl_color1 = "#00c896" if net1 >= 0 else "#ff4d4d"
     pnl_color2 = "#00c896" if net2 >= 0 else "#ff4d4d"
 
@@ -577,6 +823,12 @@ def dashboard():
     .badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; background:#21262d; color:#8b949e; border:1px solid #30363d; }
     .topbar-right { text-align:right; font-size:12px; color:#8b949e; }
     .container { padding:20px; }
+    .main-tabs { display:flex; gap:0; border-bottom:2px solid #30363d; margin-bottom:20px; }
+    .main-tab-btn { background:none; border:none; border-bottom:3px solid transparent; color:#8b949e; padding:12px 24px; font-size:14px; font-weight:700; cursor:pointer; font-family:inherit; transition:all .2s; white-space:nowrap; }
+    .main-tab-btn:hover { color:#c9d1d9; }
+    .main-tab-btn.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+    .main-tab-pane { display:none; }
+    .main-tab-pane.active { display:block; }
     .screener-tabs { display:flex; gap:8px; margin-bottom:20px; }
     .screener-btn { background:#161b22; border:2px solid #30363d; border-radius:10px; color:#8b949e; padding:10px 24px; font-size:14px; font-weight:700; cursor:pointer; font-family:inherit; transition:all .2s; }
     .screener-btn:hover { border-color:#58a6ff; color:#c9d1d9; }
@@ -603,6 +855,10 @@ def dashboard():
     .hint { font-size:12px; color:#8b949e; margin-bottom:8px; }
     .info-bar { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:8px 14px; margin-bottom:16px; font-size:12px; color:#8b949e; display:flex; gap:20px; flex-wrap:wrap; }
     .info-bar span { color:#c9d1d9; font-weight:600; }
+    .nse-section-title { font-size:13px; font-weight:700; color:#8b949e; text-transform:uppercase; letter-spacing:.05em; margin:20px 0 10px; }
+    .nse-grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+    @media(max-width:700px){ .stat-grid{grid-template-columns:repeat(3,1fr);} .nse-grid{grid-template-columns:1fr;} }
+    .error-bar { background:#2d1a1a; border:1px solid #6e2020; border-radius:8px; padding:8px 14px; margin-bottom:12px; font-size:12px; color:#ff4d4d; }
     """
 
     html = f"""<!DOCTYPE html>
@@ -630,115 +886,171 @@ def dashboard():
 
 <div class="container">
 
-  <!-- Screener Selector -->
-  <div class="screener-tabs">
-    <button class="screener-btn active" onclick="showScreener('s1',this)">
-      &#128209; tazbul &nbsp;|&nbsp; Open: {len(open_trades)} &nbsp;|&nbsp; P&amp;L: &#8377;{net1}
-    </button>
-    <button class="screener-btn" onclick="showScreener('s2',this)">
-      &#128209; TazAmol-Test1 &nbsp;|&nbsp; Open: {len(open_trades2)} &nbsp;|&nbsp; P&amp;L: &#8377;{net2}
-    </button>
+  <!-- ══ MAIN TABS ══════════════════════════════ -->
+  <div class="main-tabs">
+    <button class="main-tab-btn active" onclick="showMainTab('trading',this)">&#127939; Trading Bots</button>
+    <button class="main-tab-btn"        onclick="showMainTab('nse',this)">&#128200; NSE Market</button>
   </div>
 
-  <!-- ── SCREENER 1 — tazbul ─────────────── -->
-  <div id="s1" class="screener-panel active">
+  <!-- ══ TRADING BOTS PANEL ══════════════════════ -->
+  <div id="main-trading" class="main-tab-pane active">
+
+    <!-- Screener Selector -->
+    <div class="screener-tabs">
+      <button class="screener-btn active" onclick="showScreener('s1',this)">
+        &#128209; tazbul &nbsp;|&nbsp; Open: {len(open_trades)} &nbsp;|&nbsp; P&amp;L: &#8377;{net1}
+      </button>
+      <button class="screener-btn" onclick="showScreener('s2',this)">
+        &#128209; TazAmol-Test1 &nbsp;|&nbsp; Open: {len(open_trades2)} &nbsp;|&nbsp; P&amp;L: &#8377;{net2}
+      </button>
+    </div>
+
+    <!-- ── SCREENER 1 — tazbul ─────────────── -->
+    <div id="s1" class="screener-panel active">
+      <div class="info-bar">
+        Screener: <span>tazbul</span> &nbsp;|&nbsp;
+        SL: <span>{SL_PERCENT}%</span> &nbsp;|&nbsp;
+        TP: <span>{TP_PERCENT}%</span> &nbsp;|&nbsp;
+        Capital/Trade: <span>&#8377;{CAPITAL_PER_TRADE}</span> &nbsp;|&nbsp;
+        Webhook: <span>/alert</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" style="color:#f0b429;">{len(open_trades)}</div></div>
+        <div class="stat-card"><div class="stat-label">Trades Today</div><div class="stat-value" style="color:#58a6ff;">{len(today1)}</div></div>
+        <div class="stat-card"><div class="stat-label">Winners</div><div class="stat-value" style="color:#00c896;">{len(w1)}</div></div>
+        <div class="stat-card"><div class="stat-label">Losers</div><div class="stat-value" style="color:#ff4d4d;">{len(l1)}</div></div>
+        <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" style="color:#a78bfa;">{wr1}%</div></div>
+        <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value" style="color:{pnl_color1};">&#8377;{net1}</div></div>
+      </div>
+      <div class="pnl-grid">
+        <div class="stat-card"><div class="stat-label">Gross Profit</div><div class="stat-value" style="color:#00c896;">&#8377;{gp1}</div></div>
+        <div class="stat-card"><div class="stat-label">Gross Loss</div><div class="stat-value" style="color:#ff4d4d;">&#8377;{gl1}</div></div>
+        <div class="stat-card"><div class="stat-label">Capital / Trade</div><div class="stat-value" style="color:#58a6ff;">&#8377;{CAPITAL_PER_TRADE}</div></div>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="showTab('s1','open',this)">Open Positions ({len(open_trades)})</button>
+        <button class="tab-btn" onclick="showTab('s1','closed',this)">Today's Trades ({len(today1)})</button>
+        <button class="tab-btn" onclick="showTab('s1','history',this)">Full History</button>
+      </div>
+      <div id="s1-open" class="tab-pane active">
+        <div class="table-wrap"><table>
+          <thead><tr><th>Stock</th><th>Entry Price</th><th>Qty</th><th>Stop Loss</th><th>Take Profit</th><th>Capital Used</th><th>Entry Time</th></tr></thead>
+          <tbody>{open_rows1}</tbody>
+        </table></div>
+      </div>
+      <div id="s1-closed" class="tab-pane">
+        <div class="table-wrap"><table>
+          <thead><tr><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Exit Time</th></tr></thead>
+          <tbody>{closed_rows1}</tbody>
+        </table></div>
+      </div>
+      <div id="s1-history" class="tab-pane">
+        <div class="hint">Showing last 50 trades</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Date</th><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th></tr></thead>
+          <tbody>{history_rows1}</tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <!-- ── SCREENER 2 — TazAmol-Test1 ─────── -->
+    <div id="s2" class="screener-panel">
+      <div class="info-bar">
+        Screener: <span>TazAmol-Test1</span> &nbsp;|&nbsp;
+        SL: <span>{BOT2_SL}%</span> &nbsp;|&nbsp;
+        TP: <span>{BOT2_TP}%</span> &nbsp;|&nbsp;
+        Capital/Trade: <span>&#8377;{BOT2_CAPITAL}</span> &nbsp;|&nbsp;
+        Webhook: <span>/alert2</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" style="color:#f0b429;">{len(open_trades2)}</div></div>
+        <div class="stat-card"><div class="stat-label">Trades Today</div><div class="stat-value" style="color:#58a6ff;">{len(today2)}</div></div>
+        <div class="stat-card"><div class="stat-label">Winners</div><div class="stat-value" style="color:#00c896;">{len(w2)}</div></div>
+        <div class="stat-card"><div class="stat-label">Losers</div><div class="stat-value" style="color:#ff4d4d;">{len(l2)}</div></div>
+        <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" style="color:#a78bfa;">{wr2}%</div></div>
+        <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value" style="color:{pnl_color2};">&#8377;{net2}</div></div>
+      </div>
+      <div class="pnl-grid">
+        <div class="stat-card"><div class="stat-label">Gross Profit</div><div class="stat-value" style="color:#00c896;">&#8377;{gp2}</div></div>
+        <div class="stat-card"><div class="stat-label">Gross Loss</div><div class="stat-value" style="color:#ff4d4d;">&#8377;{gl2}</div></div>
+        <div class="stat-card"><div class="stat-label">Capital / Trade</div><div class="stat-value" style="color:#58a6ff;">&#8377;{BOT2_CAPITAL}</div></div>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="showTab('s2','open',this)">Open Positions ({len(open_trades2)})</button>
+        <button class="tab-btn" onclick="showTab('s2','closed',this)">Today's Trades ({len(today2)})</button>
+        <button class="tab-btn" onclick="showTab('s2','history',this)">Full History</button>
+      </div>
+      <div id="s2-open" class="tab-pane active">
+        <div class="table-wrap"><table>
+          <thead><tr><th>Stock</th><th>Entry Price</th><th>Qty</th><th>Stop Loss</th><th>Take Profit</th><th>Capital Used</th><th>Entry Time</th></tr></thead>
+          <tbody>{open_rows2}</tbody>
+        </table></div>
+      </div>
+      <div id="s2-closed" class="tab-pane">
+        <div class="table-wrap"><table>
+          <thead><tr><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Exit Time</th></tr></thead>
+          <tbody>{closed_rows2}</tbody>
+        </table></div>
+      </div>
+      <div id="s2-history" class="tab-pane">
+        <div class="hint">Showing last 50 trades</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Date</th><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th></tr></thead>
+          <tbody>{history_rows2}</tbody>
+        </table></div>
+      </div>
+    </div>
+
+  </div><!-- end main-trading -->
+
+  <!-- ══ NSE MARKET PANEL ════════════════════ -->
+  <div id="main-nse" class="main-tab-pane">
+
     <div class="info-bar">
-      Screener: <span>tazbul</span> &nbsp;|&nbsp;
-      SL: <span>{SL_PERCENT}%</span> &nbsp;|&nbsp;
-      TP: <span>{TP_PERCENT}%</span> &nbsp;|&nbsp;
-      Capital/Trade: <span>&#8377;{CAPITAL_PER_TRADE}</span> &nbsp;|&nbsp;
-      Webhook: <span>/alert</span>
+      Data Source: <span>NSE India (nseindia.com)</span> &nbsp;|&nbsp;
+      Cache TTL: <span>60s</span> &nbsp;|&nbsp;
+      Last Fetched: <span>{nse_time}</span>
     </div>
-    <div class="stat-grid">
-      <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" style="color:#f0b429;">{len(open_trades)}</div></div>
-      <div class="stat-card"><div class="stat-label">Trades Today</div><div class="stat-value" style="color:#58a6ff;">{len(today1)}</div></div>
-      <div class="stat-card"><div class="stat-label">Winners</div><div class="stat-value" style="color:#00c896;">{len(w1)}</div></div>
-      <div class="stat-card"><div class="stat-label">Losers</div><div class="stat-value" style="color:#ff4d4d;">{len(l1)}</div></div>
-      <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" style="color:#a78bfa;">{wr1}%</div></div>
-      <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value" style="color:{pnl_color1};">&#8377;{net1}</div></div>
-    </div>
-    <div class="pnl-grid">
-      <div class="stat-card"><div class="stat-label">Gross Profit</div><div class="stat-value" style="color:#00c896;">&#8377;{gp1}</div></div>
-      <div class="stat-card"><div class="stat-label">Gross Loss</div><div class="stat-value" style="color:#ff4d4d;">&#8377;{gl1}</div></div>
-      <div class="stat-card"><div class="stat-label">Capital / Trade</div><div class="stat-value" style="color:#58a6ff;">&#8377;{CAPITAL_PER_TRADE}</div></div>
-    </div>
-    <div class="tabs">
-      <button class="tab-btn active" onclick="showTab('s1','open',this)">Open Positions ({len(open_trades)})</button>
-      <button class="tab-btn" onclick="showTab('s1','closed',this)">Today's Trades ({len(today1)})</button>
-      <button class="tab-btn" onclick="showTab('s1','history',this)">Full History</button>
-    </div>
-    <div id="s1-open" class="tab-pane active">
-      <div class="table-wrap"><table>
-        <thead><tr><th>Stock</th><th>Entry Price</th><th>Qty</th><th>Stop Loss</th><th>Take Profit</th><th>Capital Used</th><th>Entry Time</th></tr></thead>
-        <tbody>{open_rows1}</tbody>
-      </table></div>
-    </div>
-    <div id="s1-closed" class="tab-pane">
-      <div class="table-wrap"><table>
-        <thead><tr><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Exit Time</th></tr></thead>
-        <tbody>{closed_rows1}</tbody>
-      </table></div>
-    </div>
-    <div id="s1-history" class="tab-pane">
-      <div class="hint">Showing last 50 trades</div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th></tr></thead>
-        <tbody>{history_rows1}</tbody>
-      </table></div>
-    </div>
-  </div>
 
-  <!-- ── SCREENER 2 — TazAmol-Test1 ─────── -->
-  <div id="s2" class="screener-panel">
-    <div class="info-bar">
-      Screener: <span>TazAmol-Test1</span> &nbsp;|&nbsp;
-      SL: <span>{BOT2_SL}%</span> &nbsp;|&nbsp;
-      TP: <span>{BOT2_TP}%</span> &nbsp;|&nbsp;
-      Capital/Trade: <span>&#8377;{BOT2_CAPITAL}</span> &nbsp;|&nbsp;
-      Webhook: <span>/alert2</span>
-    </div>
-    <div class="stat-grid">
-      <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" style="color:#f0b429;">{len(open_trades2)}</div></div>
-      <div class="stat-card"><div class="stat-label">Trades Today</div><div class="stat-value" style="color:#58a6ff;">{len(today2)}</div></div>
-      <div class="stat-card"><div class="stat-label">Winners</div><div class="stat-value" style="color:#00c896;">{len(w2)}</div></div>
-      <div class="stat-card"><div class="stat-label">Losers</div><div class="stat-value" style="color:#ff4d4d;">{len(l2)}</div></div>
-      <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" style="color:#a78bfa;">{wr2}%</div></div>
-      <div class="stat-card"><div class="stat-label">Net P&amp;L</div><div class="stat-value" style="color:{pnl_color2};">&#8377;{net2}</div></div>
-    </div>
-    <div class="pnl-grid">
-      <div class="stat-card"><div class="stat-label">Gross Profit</div><div class="stat-value" style="color:#00c896;">&#8377;{gp2}</div></div>
-      <div class="stat-card"><div class="stat-label">Gross Loss</div><div class="stat-value" style="color:#ff4d4d;">&#8377;{gl2}</div></div>
-      <div class="stat-card"><div class="stat-label">Capital / Trade</div><div class="stat-value" style="color:#58a6ff;">&#8377;{BOT2_CAPITAL}</div></div>
-    </div>
-    <div class="tabs">
-      <button class="tab-btn active" onclick="showTab('s2','open',this)">Open Positions ({len(open_trades2)})</button>
-      <button class="tab-btn" onclick="showTab('s2','closed',this)">Today's Trades ({len(today2)})</button>
-      <button class="tab-btn" onclick="showTab('s2','history',this)">Full History</button>
-    </div>
-    <div id="s2-open" class="tab-pane active">
-      <div class="table-wrap"><table>
-        <thead><tr><th>Stock</th><th>Entry Price</th><th>Qty</th><th>Stop Loss</th><th>Take Profit</th><th>Capital Used</th><th>Entry Time</th></tr></thead>
-        <tbody>{open_rows2}</tbody>
-      </table></div>
-    </div>
-    <div id="s2-closed" class="tab-pane">
-      <div class="table-wrap"><table>
-        <thead><tr><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Exit Time</th></tr></thead>
-        <tbody>{closed_rows2}</tbody>
-      </table></div>
-    </div>
-    <div id="s2-history" class="tab-pane">
-      <div class="hint">Showing last 50 trades</div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Stock</th><th>Entry Price</th><th>Exit Price</th><th>Qty</th><th>P&amp;L</th><th>Reason</th></tr></thead>
-        <tbody>{history_rows2}</tbody>
-      </table></div>
-    </div>
-  </div>
+    {"<div class='error-bar'>&#9888; " + nse_err + "</div>" if nse_err else ""}
 
-</div>
+    <!-- Advances / Declines -->
+    <div class="nse-section-title">&#128200; Market Breadth — Nifty 50</div>
+    {adv_dec_h}
+
+    <div class="nse-grid">
+
+      <!-- Pre-open Top 10 -->
+      <div>
+        <div class="nse-section-title">&#9728; Pre-Open Market — Top 10 Nifty 50 Movers</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Symbol</th><th>IEP (&#8377;)</th><th>LTP (&#8377;)</th><th>Change %</th><th>Volume</th></tr></thead>
+          <tbody>{preopen_r}</tbody>
+        </table></div>
+      </div>
+
+      <!-- Sector Volume -->
+      <div>
+        <div class="nse-section-title">&#127970; Sector Activity (by Volume)</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Sector</th><th>Volume</th><th>Index Change %</th></tr></thead>
+          <tbody>{sector_r}</tbody>
+        </table></div>
+      </div>
+
+    </div><!-- end nse-grid -->
+
+  </div><!-- end main-nse -->
+
+</div><!-- end container -->
 
 <script>
+function showMainTab(id, btn) {{
+  document.querySelectorAll('.main-tab-pane').forEach(function(p) {{ p.classList.remove('active'); }});
+  document.querySelectorAll('.main-tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+  document.getElementById('main-' + id).classList.add('active');
+  btn.classList.add('active');
+}}
 function showScreener(id, btn) {{
   document.querySelectorAll('.screener-panel').forEach(function(p) {{ p.classList.remove('active'); }});
   document.querySelectorAll('.screener-btn').forEach(function(b) {{ b.classList.remove('active'); }});
