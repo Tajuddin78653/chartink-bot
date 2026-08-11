@@ -315,8 +315,7 @@ def report():
 # ─────────────────────────────────────────────
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    # ── read CSV history ──────────────────────
-    history = []
+    history  = []
     csv_path = "logs/trades.csv"
     if os.path.exists(csv_path):
         with open(csv_path, newline="") as f:
@@ -324,23 +323,21 @@ def dashboard():
             for row in reader:
                 history.append(row)
 
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    today_str    = datetime.now(IST).strftime("%Y-%m-%d")
     today_closed = [r for r in history if r.get("date") == today_str]
 
-    # ── stats ─────────────────────────────────
-    total_trades   = len(today_closed)
-    winners        = [r for r in today_closed if r.get("result") == "WIN"]
-    losers         = [r for r in today_closed if r.get("result") == "LOSS"]
-    net_pnl        = round(sum(float(r["pnl"]) for r in today_closed), 2)
-    gross_profit   = round(sum(float(r["pnl"]) for r in winners), 2)
-    gross_loss     = round(abs(sum(float(r["pnl"]) for r in losers)), 2)
-    win_rate       = round((len(winners) / total_trades * 100) if total_trades else 0, 1)
-    open_count     = len(open_trades)
-    mode_label     = "🧪 Paper Trading" if PAPER_TRADING else "⚡ Live Trading"
-    pnl_color      = "#00c896" if net_pnl >= 0 else "#ff4d4d"
-    market_status  = "🟢 Market Open" if is_market_hours() else "🔴 Market Closed"
+    total_trades = len(today_closed)
+    winners      = [r for r in today_closed if r.get("result") == "WIN"]
+    losers       = [r for r in today_closed if r.get("result") == "LOSS"]
+    net_pnl      = round(sum(float(r["pnl"]) for r in today_closed), 2)
+    gross_profit = round(sum(float(r["pnl"]) for r in winners), 2)
+    gross_loss   = round(abs(sum(float(r["pnl"]) for r in losers)), 2)
+    win_rate     = round((len(winners) / total_trades * 100) if total_trades else 0, 1)
+    open_count   = len(open_trades)
+    mode_label   = "🧪 Paper Trading" if PAPER_TRADING else "⚡ Live Trading"
+    pnl_color    = "#00c896" if net_pnl >= 0 else "#ff4d4d"
+    mkt_status   = "🟢 Market Open" if is_market_hours() else "🔴 Market Closed"
 
-    # ── open positions rows ───────────────────
     open_rows = ""
     for sym, t in open_trades.items():
         open_rows += f"""
@@ -356,7 +353,6 @@ def dashboard():
     if not open_rows:
         open_rows = '<tr><td colspan="7" class="text-center text-muted">No open positions</td></tr>'
 
-    # ── closed trades rows ────────────────────
     closed_rows = ""
     for r in reversed(today_closed):
         pnl_val = float(r["pnl"])
@@ -375,7 +371,6 @@ def dashboard():
     if not closed_rows:
         closed_rows = '<tr><td colspan="7" class="text-center text-muted">No closed trades today</td></tr>'
 
-    # ── all history rows ──────────────────────
     history_rows = ""
     for r in reversed(history[-50:]):
         pnl_val = float(r["pnl"])
@@ -418,165 +413,67 @@ def dashboard():
   </style>
 </head>
 <body>
-
-<!-- Top Bar -->
 <div class="top-bar d-flex justify-content-between align-items-center flex-wrap gap-2">
   <div>
     <span style="font-size:1.2rem;font-weight:700;color:#58a6ff;">📊 Chartink Bot</span>
     <span class="ms-3 badge bg-secondary">{mode_label}</span>
-    <span class="ms-2 badge bg-dark border">{market_status}</span>
+    <span class="ms-2 badge bg-dark border">{mkt_status}</span>
   </div>
   <div class="text-end">
     <div style="color:#c9d1d9;">🕐 {time_str()}</div>
     <div class="refresh-note">⟳ Auto-refresh every 30s</div>
   </div>
 </div>
-
 <div class="container-fluid py-4 px-3 px-md-4">
-
-  <!-- Summary Cards -->
   <div class="row g-3 mb-4">
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Open Positions</div>
-        <div class="stat-val text-warning">{open_count}</div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Trades Today</div>
-        <div class="stat-val text-info">{total_trades}</div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Winners</div>
-        <div class="stat-val text-success">{len(winners)}</div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Losers</div>
-        <div class="stat-val text-danger">{len(losers)}</div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Win Rate</div>
-        <div class="stat-val" style="color:#a78bfa;">{win_rate}%</div>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Net P&L</div>
-        <div class="stat-val" style="color:{pnl_color};">₹{net_pnl}</div>
-      </div>
-    </div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Open Positions</div><div class="stat-val text-warning">{open_count}</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Trades Today</div><div class="stat-val text-info">{total_trades}</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Winners</div><div class="stat-val text-success">{len(winners)}</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Losers</div><div class="stat-val text-danger">{len(losers)}</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Win Rate</div><div class="stat-val" style="color:#a78bfa;">{win_rate}%</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Net P&L</div><div class="stat-val" style="color:{pnl_color};">₹{net_pnl}</div></div></div>
   </div>
-
-  <!-- P&L Detail Row -->
   <div class="row g-3 mb-4">
-    <div class="col-md-4">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Gross Profit</div>
-        <div class="stat-val text-success">₹{gross_profit}</div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Gross Loss</div>
-        <div class="stat-val text-danger">₹{gross_loss}</div>
-      </div>
-    </div>
-    <div class="col-md-4">
-      <div class="card p-3 text-center">
-        <div class="text-muted small">Capital / Trade</div>
-        <div class="stat-val text-info">₹{CAPITAL_PER_TRADE}</div>
-      </div>
-    </div>
+    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Gross Profit</div><div class="stat-val text-success">₹{gross_profit}</div></div></div>
+    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Gross Loss</div><div class="stat-val text-danger">₹{gross_loss}</div></div></div>
+    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Capital / Trade</div><div class="stat-val text-info">₹{CAPITAL_PER_TRADE}</div></div></div>
   </div>
-
-  <!-- Tabs -->
   <ul class="nav nav-tabs" id="dashTabs">
-    <li class="nav-item">
-      <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-open">
-        🟡 Open Positions <span class="badge bg-warning text-dark ms-1">{open_count}</span>
-      </button>
-    </li>
-    <li class="nav-item">
-      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-closed">
-        📋 Today's Trades <span class="badge bg-secondary ms-1">{total_trades}</span>
-      </button>
-    </li>
-    <li class="nav-item">
-      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-history">
-        📁 Full History
-      </button>
-    </li>
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-open">🟡 Open Positions <span class="badge bg-warning text-dark ms-1">{open_count}</span></button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-closed">📋 Today's Trades <span class="badge bg-secondary ms-1">{total_trades}</span></button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-history">📁 Full History</button></li>
   </ul>
-
   <div class="tab-content mt-3">
-
-    <!-- Open Positions Tab -->
     <div class="tab-pane fade show active" id="tab-open">
-      <div class="card">
-        <div class="table-responsive">
-          <table class="table table-dark table-hover mb-0">
-            <thead>
-              <tr>
-                <th>Stock</th><th>Entry</th><th>Qty</th>
-                <th>Stop Loss</th><th>Take Profit</th>
-                <th>Capital</th><th>Entry Time</th>
-              </tr>
-            </thead>
-            <tbody>{open_rows}</tbody>
-          </table>
-        </div>
-      </div>
+      <div class="card"><div class="table-responsive">
+        <table class="table table-dark table-hover mb-0">
+          <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>Stop Loss</th><th>Take Profit</th><th>Capital</th><th>Entry Time</th></tr></thead>
+          <tbody>{open_rows}</tbody>
+        </table>
+      </div></div>
     </div>
-
-    <!-- Today Closed Tab -->
     <div class="tab-pane fade" id="tab-closed">
-      <div class="card">
-        <div class="table-responsive">
-          <table class="table table-dark table-hover mb-0">
-            <thead>
-              <tr>
-                <th>Stock</th><th>Entry</th><th>Exit</th>
-                <th>Qty</th><th>P&L</th><th>Reason</th><th>Exit Time</th>
-              </tr>
-            </thead>
-            <tbody>{closed_rows}</tbody>
-          </table>
-        </div>
-      </div>
+      <div class="card"><div class="table-responsive">
+        <table class="table table-dark table-hover mb-0">
+          <thead><tr><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Reason</th><th>Exit Time</th></tr></thead>
+          <tbody>{closed_rows}</tbody>
+        </table>
+      </div></div>
     </div>
-
-    <!-- History Tab -->
     <div class="tab-pane fade" id="tab-history">
       <div class="text-muted small mb-2">Showing last 50 trades</div>
-      <div class="card">
-        <div class="table-responsive">
-          <table class="table table-dark table-hover mb-0">
-            <thead>
-              <tr>
-                <th>Date</th><th>Stock</th><th>Entry</th>
-                <th>Exit</th><th>Qty</th><th>P&L</th><th>Reason</th>
-              </tr>
-            </thead>
-            <tbody>{history_rows}</tbody>
-          </table>
-        </div>
-      </div>
+      <div class="card"><div class="table-responsive">
+        <table class="table table-dark table-hover mb-0">
+          <thead><tr><th>Date</th><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&L</th><th>Reason</th></tr></thead>
+          <tbody>{history_rows}</tbody>
+        </table>
+      </div></div>
     </div>
-
   </div>
 </div>
-
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>"""
-
     return html
 
 # ─────────────────────────────────────────────
