@@ -1132,12 +1132,6 @@ function showScreener(id,btn){{
   btn.classList.add('active');
 }}
 function showTab(s,name,btn){{
-
-_[Continuing response due to length limit...]_
-
-Continuing exactly from where it stopped:
-
-```python
   document.querySelectorAll('#'+s+' .tab-pane').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('#'+s+' .tab-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById(s+'-'+name).classList.add('active');
