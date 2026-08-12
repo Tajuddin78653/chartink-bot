@@ -3,5 +3,5 @@ requests
 pytz
 gunicorn
 pandas
-pandas-ta
+ta
 yfinance
