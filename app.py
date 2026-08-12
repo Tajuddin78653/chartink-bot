@@ -975,12 +975,14 @@ function showMain(id,btn){{
   document.querySelectorAll('.mtb').forEach(function(b){{b.classList.remove('active');}});
   document.getElementById('main-'+id).classList.add('active');
   btn.classList.add('active');
+  window.location.hash = 'tab-'+id;
 }}
 function showS(id,btn){{
   document.querySelectorAll('.sp').forEach(function(p){{p.classList.remove('active');}});
   document.querySelectorAll('.sb').forEach(function(b){{b.classList.remove('active');}});
   document.getElementById(id).classList.add('active');
   btn.classList.add('active');
+  window.location.hash = window.location.hash.split('|')[0]+'|screener-'+id;
 }}
 function showT(s,name,btn){{
   document.querySelectorAll('#'+s+' .tp').forEach(function(p){{p.classList.remove('active');}});
@@ -995,6 +997,38 @@ function doScan(btn){{
     setTimeout(function(){{location.reload();}},10000);
   }});
 }}
+// ── Restore active tab on page load/refresh ──
+(function(){{
+  var hash = window.location.hash || '';
+  var parts = hash.split('|');
+
+  // Restore main tab
+  var mainTab = 'trading';
+  parts.forEach(function(p){{
+    if(p.indexOf('tab-')===0) mainTab = p.replace('tab-','');
+  }});
+  var mainBtn = document.querySelector('.mtb[onclick*="' + mainTab + '"]');
+  if(mainBtn){{
+    document.querySelectorAll('.mtp').forEach(function(p){{p.classList.remove('active');}});
+    document.querySelectorAll('.mtb').forEach(function(b){{b.classList.remove('active');}});
+    document.getElementById('main-'+mainTab).classList.add('active');
+    mainBtn.classList.add('active');
+  }}
+
+  // Restore screener tab
+  parts.forEach(function(p){{
+    if(p.indexOf('screener-')===0){{
+      var sid = p.replace('screener-','');
+      var sBtn = document.querySelector('.sb[onclick*="' + sid + '"]');
+      if(sBtn){{
+        document.querySelectorAll('.sp').forEach(function(x){{x.classList.remove('active');}});
+        document.querySelectorAll('.sb').forEach(function(x){{x.classList.remove('active');}});
+        document.getElementById(sid).classList.add('active');
+        sBtn.classList.add('active');
+      }}
+    }}
+  }});
+}})();
 </script>
 </body>
 </html>"""
