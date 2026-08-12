@@ -190,17 +190,12 @@ def fetch_candles(symbol):
         return None
 
 def calc_indicators(df):
-    """Add EMA13, EMA50, ATR14, ADX14 columns to df."""
     try:
-        import pandas_ta as ta
-        df["ema13"] = ta.ema(df["close"], length=13)
-        df["ema50"] = ta.ema(df["close"], length=50)
-        df["atr"]   = ta.atr(df["high"], df["low"], df["close"], length=14)
-        adx_df      = ta.adx(df["high"], df["low"], df["close"], length=14)
-        if adx_df is not None and "ADX_14" in adx_df.columns:
-            df["adx"] = adx_df["ADX_14"]
-        else:
-            df["adx"] = 0
+        import ta as ta_lib
+        df["ema13"] = ta_lib.trend.ema_indicator(df["close"], window=13)
+        df["ema50"] = ta_lib.trend.ema_indicator(df["close"], window=50)
+        df["atr"]   = ta_lib.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+        df["adx"]   = ta_lib.trend.adx(df["high"], df["low"], df["close"], window=14)
         return df
     except:
         return None
