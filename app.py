@@ -712,6 +712,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
   <button class="mtb active" onclick="showMain('trading',this)">&#127939; Trading Bots</button>
   <button class="mtb" onclick="showMain('signals',this)">&#129302; Signal Engine <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{nb}B {ns}S</span></button>
   <button class="mtb" onclick="showMain('nse',this)">&#128200; NSE Market</button>
+  <button class="mtb" onclick="showMain('chartink',this)">&#128202; Chartink Guide</button>
 </div>
 
 <!-- TRADING BOTS -->
@@ -823,6 +824,156 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
         <thead><tr><th>Sector</th><th>Volume</th><th>Change %</th></tr></thead>
         <tbody>{tbl_sectors(nse.get('sectors',[]))}</tbody>
       </table></div>
+    </div>
+  </div>
+</div>
+
+<!-- CHARTINK GUIDE -->
+<div id="main-chartink" class="mtp">
+  <div class="ib" style="margin-bottom:18px;">Platform:<span>chartink.com</span> Type:<span>Free Stock Screener</span> Usage:<span>Webhook Alerts to this Bot</span></div>
+
+  <!-- Overview Cards -->
+  <div class="sg" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:22px;">
+    <div class="sc" style="border-color:#58a6ff22;">
+      <div class="sl">&#128202; Custom Screeners</div>
+      <div class="sv" style="font-size:1rem;color:#58a6ff;">EMA / RSI / MACD / ADX / Volume</div>
+    </div>
+    <div class="sc" style="border-color:#00c89622;">
+      <div class="sl">&#128276; Alert System</div>
+      <div class="sv" style="font-size:1rem;color:#00c896;">Trigger when conditions match</div>
+    </div>
+    <div class="sc" style="border-color:#a78bfa22;">
+      <div class="sl">&#128225; Webhook Alerts</div>
+      <div class="sv" style="font-size:1rem;color:#a78bfa;">Sends to this bot instantly</div>
+    </div>
+    <div class="sc" style="border-color:#f0b42922;">
+      <div class="sl">&#128337; Timeframes</div>
+      <div class="sv" style="font-size:1rem;color:#f0b429;">1min · 5min · 15min · Daily</div>
+    </div>
+  </div>
+
+  <!-- Webhook URLs Section -->
+  <div class="nt" style="margin-bottom:10px;">&#128279; Your Active Webhook URLs</div>
+  <div class="tw" style="margin-bottom:22px;"><table>
+    <thead><tr><th>Screener</th><th>Webhook URL</th><th>Bot</th><th>SL</th><th>TP</th><th>Capital</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span style="color:#58a6ff;font-weight:700;">tazbul</span></td>
+        <td><code style="background:#161b22;padding:3px 8px;border-radius:5px;font-size:12px;color:#a78bfa;">https://chartink-bot-c77y.onrender.com/alert</code></td>
+        <td>&#128038; @Taj_alerts_bot</td>
+        <td style="color:#ff4d4d;">{SL_PERCENT}%</td>
+        <td style="color:#00c896;">{TP_PERCENT}%</td>
+        <td style="color:#58a6ff;">&#8377;{CAPITAL_PER_TRADE}</td>
+      </tr>
+      <tr>
+        <td><span style="color:#f0b429;font-weight:700;">TazAmol-Test1</span></td>
+        <td><code style="background:#161b22;padding:3px 8px;border-radius:5px;font-size:12px;color:#a78bfa;">https://chartink-bot-c77y.onrender.com/alert2</code></td>
+        <td>&#128038; @tazubot_bot</td>
+        <td style="color:#ff4d4d;">{BOT2_SL}%</td>
+        <td style="color:#00c896;">{BOT2_TP}%</td>
+        <td style="color:#58a6ff;">&#8377;{BOT2_CAPITAL}</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <!-- How to Setup -->
+  <div class="nt" style="margin-bottom:10px;">&#128218; How to Setup a Chartink Alert → Webhook</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:22px;">
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;">
+      <div style="font-size:1.1rem;font-weight:700;color:#58a6ff;margin-bottom:10px;">&#9312; Create a Screener</div>
+      <ul style="color:#c9d1d9;font-size:13px;line-height:1.9;margin:0;padding-left:18px;">
+        <li>Go to <b style="color:#58a6ff;">chartink.com</b></li>
+        <li>Click <b>Screener</b> → <b>Create New</b></li>
+        <li>Add your conditions (EMA, RSI, Volume…)</li>
+        <li>Choose timeframe: 1min / 5min / 15min / Daily</li>
+        <li>Save the screener with a name</li>
+      </ul>
+    </div>
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;">
+      <div style="font-size:1.1rem;font-weight:700;color:#00c896;margin-bottom:10px;">&#9313; Set Up Alert</div>
+      <ul style="color:#c9d1d9;font-size:13px;line-height:1.9;margin:0;padding-left:18px;">
+        <li>Open your screener</li>
+        <li>Click <b>Alert</b> button (bell icon &#128276;)</li>
+        <li>Set frequency: <b>Every candle / Once</b></li>
+        <li>Enable <b>Webhook</b> toggle</li>
+        <li>Paste your webhook URL below</li>
+      </ul>
+    </div>
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;">
+      <div style="font-size:1.1rem;font-weight:700;color:#a78bfa;margin-bottom:10px;">&#9314; Paste Webhook URL</div>
+      <ul style="color:#c9d1d9;font-size:13px;line-height:1.9;margin:0;padding-left:18px;">
+        <li>Bot 1 (tazbul): <code style="color:#a78bfa;font-size:11px;">/alert</code></li>
+        <li>Bot 2 (TazAmol): <code style="color:#a78bfa;font-size:11px;">/alert2</code></li>
+        <li>Chartink sends: <b>stock name + price</b></li>
+        <li>Bot auto-places paper trade</li>
+        <li>Telegram notification sent instantly</li>
+      </ul>
+    </div>
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;">
+      <div style="font-size:1.1rem;font-weight:700;color:#f0b429;margin-bottom:10px;">&#9315; Webhook Payload</div>
+      <div style="color:#8b949e;font-size:12px;margin-bottom:6px;">Chartink sends this JSON to your bot:</div>
+      <pre style="background:#0d1117;border-radius:6px;padding:10px;font-size:11px;color:#e6edf3;overflow-x:auto;margin:0;">{{"stocks": "RELIANCE 2450.50, TCS 3200.00",
+"trigger_prices": "2450.50 3200.00",
+"triggered_at": "2025-01-15 09:30:00",
+"scan_name": "tazbul"}}</pre>
+    </div>
+  </div>
+
+  <!-- Indicator Reference -->
+  <div class="nt" style="margin-bottom:10px;">&#128269; Common Chartink Indicators Reference</div>
+  <div class="tw" style="margin-bottom:22px;"><table>
+    <thead><tr><th>Indicator</th><th>What It Measures</th><th>Common Use</th><th>Chartink Syntax Example</th></tr></thead>
+    <tbody>
+      <tr><td><b style="color:#58a6ff;">EMA</b></td><td>Exponential Moving Average — trend direction</td><td>EMA 13 crosses above EMA 50 → BUY</td><td><code style="font-size:11px;color:#a78bfa;">[{{"weekly": 0}}] EMA(13,close) &gt; EMA(50,close)</code></td></tr>
+      <tr><td><b style="color:#00c896;">RSI</b></td><td>Relative Strength Index — momentum (0–100)</td><td>RSI &gt; 60 → bullish momentum</td><td><code style="font-size:11px;color:#a78bfa;">RSI(14,close) &gt; 60</code></td></tr>
+      <tr><td><b style="color:#f0b429;">MACD</b></td><td>Moving Average Convergence Divergence</td><td>MACD line crosses signal → entry</td><td><code style="font-size:11px;color:#a78bfa;">MACD(12,26,9,close) &gt; MACDSIGNAL(12,26,9,close)</code></td></tr>
+      <tr><td><b style="color:#a78bfa;">ADX</b></td><td>Average Directional Index — trend strength</td><td>ADX &gt; 20 → trending market (our bot uses this!)</td><td><code style="font-size:11px;color:#a78bfa;">ADX(14,14,close) &gt; 20</code></td></tr>
+      <tr><td><b style="color:#ff4d4d;">Volume</b></td><td>Trading volume — confirms price moves</td><td>Volume &gt; 1.5x 20-day avg → breakout</td><td><code style="font-size:11px;color:#a78bfa;">Volume &gt; 1.5 * SMA(20,Volume)</code></td></tr>
+      <tr><td><b style="color:#58a6ff;">Bollinger Bands</b></td><td>Price volatility bands around SMA</td><td>Price touches lower band → oversold</td><td><code style="font-size:11px;color:#a78bfa;">close &lt; LBB(20,2,close)</code></td></tr>
+      <tr><td><b style="color:#00c896;">Supertrend</b></td><td>ATR-based trend-following indicator</td><td>Supertrend buy → bullish signal</td><td><code style="font-size:11px;color:#a78bfa;">Supertrend(7,3,close) = 1</code></td></tr>
+      <tr><td><b style="color:#f0b429;">ATR</b></td><td>Average True Range — volatility measure</td><td>Used for SL/TP calculation (our bot uses ATR×1.5 SL)</td><td><code style="font-size:11px;color:#a78bfa;">ATR(14,close) &gt; 5</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- Timeframe Guide -->
+  <div class="nt" style="margin-bottom:10px;">&#128337; Timeframe Guide</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:22px;">
+    <div style="background:#161b22;border:1px solid #238636;border-radius:10px;padding:14px;text-align:center;">
+      <div style="font-size:1.3rem;font-weight:700;color:#00c896;">1 min</div>
+      <div style="font-size:12px;color:#8b949e;margin-top:5px;">Scalping · Very fast signals · High noise</div>
+    </div>
+    <div style="background:#161b22;border:1px solid #1f6feb;border-radius:10px;padding:14px;text-align:center;">
+      <div style="font-size:1.3rem;font-weight:700;color:#58a6ff;">5 min</div>
+      <div style="font-size:12px;color:#8b949e;margin-top:5px;">Intraday · Our bot uses this · Good balance</div>
+    </div>
+    <div style="background:#161b22;border:1px solid #6e40c9;border-radius:10px;padding:14px;text-align:center;">
+      <div style="font-size:1.3rem;font-weight:700;color:#a78bfa;">15 min</div>
+      <div style="font-size:12px;color:#8b949e;margin-top:5px;">Intraday · Less noise · Slower entries</div>
+    </div>
+    <div style="background:#161b22;border:1px solid #9e6a03;border-radius:10px;padding:14px;text-align:center;">
+      <div style="font-size:1.3rem;font-weight:700;color:#f0b429;">Daily</div>
+      <div style="font-size:12px;color:#8b949e;margin-top:5px;">Swing trading · Weekly/Monthly holds</div>
+    </div>
+  </div>
+
+  <!-- Quick Tips -->
+  <div class="nt" style="margin-bottom:10px;">&#128161; Pro Tips</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:10px;">
+    <div style="background:#161b22;border-left:3px solid #00c896;border-radius:6px;padding:12px 15px;">
+      <div style="color:#00c896;font-weight:700;margin-bottom:5px;">&#10003; Use ADX Filter</div>
+      <div style="color:#c9d1d9;font-size:13px;">Always add ADX &gt; 20 to avoid sideways market trades. Our Signal Engine already does this!</div>
+    </div>
+    <div style="background:#161b22;border-left:3px solid #58a6ff;border-radius:6px;padding:12px 15px;">
+      <div style="color:#58a6ff;font-weight:700;margin-bottom:5px;">&#10003; Volume Confirmation</div>
+      <div style="color:#c9d1d9;font-size:13px;">Add Volume &gt; 1.5× average to confirm breakouts. Reduces false signals by ~40%.</div>
+    </div>
+    <div style="background:#161b22;border-left:3px solid #a78bfa;border-radius:6px;padding:12px 15px;">
+      <div style="color:#a78bfa;font-weight:700;margin-bottom:5px;">&#10003; Multiple Timeframe</div>
+      <div style="color:#c9d1d9;font-size:13px;">Create a 15-min screener for direction + 5-min for entry. Higher accuracy confluence.</div>
+    </div>
+    <div style="background:#161b22;border-left:3px solid #f0b429;border-radius:6px;padding:12px 15px;">
+      <div style="color:#f0b429;font-weight:700;margin-bottom:5px;">&#10003; Test Before Live</div>
+      <div style="color:#c9d1d9;font-size:13px;">Run paper trading (enabled now ✅) for at least 2 weeks before switching to live money.</div>
     </div>
   </div>
 </div>
@@ -944,3 +1095,4 @@ send(f"🟢 <b>Bot2 TazAmol-Test1 LIVE</b>\n💰 ₹{BOT2_CAPITAL} SL:{BOT2_SL}%
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=PORT)
+
