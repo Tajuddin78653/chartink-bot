@@ -122,6 +122,47 @@ def log_trade(trade, exit_price, pnl, reason, logfile):
             pnl,"WIN" if pnl>=0 else "LOSS",reason,trade["entry_time"],trade["exit_time"]])
 
 # ─────────────────────────────────────────────
+#  LIVE PRICES API
+# ─────────────────────────────────────────────
+@app.route("/prices", methods=["GET"])
+def prices_api():
+    """Returns live price + unrealised PnL for all open positions (both bots)."""
+    result = {}
+    for sym, t in open_trades.items():
+        price = get_price(sym)
+        if price:
+            unreal = round((price - t["entry"]) * t["qty"], 2)
+            pct    = round((price - t["entry"]) / t["entry"] * 100, 2)
+            result[sym] = {"price":price, "unrealised_pnl":unreal, "pct":pct, "bot":"1"}
+    for sym, t in open_trades2.items():
+        price = get_price(sym)
+        if price:
+            unreal = round((price - t["entry"]) * t["qty"], 2)
+            pct    = round((price - t["entry"]) / t["entry"] * 100, 2)
+            result[sym+"__2"] = {"price":price, "unrealised_pnl":unreal, "pct":pct, "bot":"2"}
+    return jsonify(result), 200
+
+# ─────────────────────────────────────────────
+#  MANUAL CLOSE API
+# ─────────────────────────────────────────────
+@app.route("/close/<bot>/<symbol>", methods=["POST"])
+def manual_close(bot, symbol):
+    symbol = symbol.upper()
+    if bot == "1":
+        if symbol not in open_trades:
+            return jsonify({"status":"not found"}), 404
+        price = get_price(symbol) or open_trades[symbol]["entry"]
+        close_trade(symbol, price, "🖱️ Manual Close")
+        return jsonify({"status":"closed","symbol":symbol,"price":price}), 200
+    elif bot == "2":
+        if symbol not in open_trades2:
+            return jsonify({"status":"not found"}), 404
+        price = get_price(symbol) or open_trades2[symbol]["entry"]
+        close_trade2(symbol, price, "🖱️ Manual Close")
+        return jsonify({"status":"closed","symbol":symbol,"price":price}), 200
+    return jsonify({"status":"invalid bot"}), 400
+
+# ─────────────────────────────────────────────
 #  NSE MARKET DATA — Yahoo Finance
 # ─────────────────────────────────────────────
 def fetch_nse_data():
@@ -498,13 +539,28 @@ def stats(rows):
     wr=round(len(w)/len(rows)*100 if rows else 0,1)
     return w,l,net,gp,gl,wr
 
-def tbl_open(d):
-    if not d: return '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px;">No open positions</td></tr>'
-    return "".join(f'<tr><td><b>{s}</b></td><td>&#8377;{t["entry"]}</td><td>{t["qty"]}</td>'
-                   f'<td style="color:#ff4d4d;">&#8377;{t["sl"]}</td>'
-                   f'<td style="color:#00c896;">&#8377;{t["tp"]}</td>'
-                   f'<td>&#8377;{t["capital_used"]}</td><td>{t["entry_time"]}</td></tr>'
-                   for s,t in d.items())
+def tbl_open(d, bot_num):
+    """Build open positions table with live price + unrealised PnL + close button."""
+    if not d:
+        return '<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No open positions</td></tr>'
+    rows=""
+    for s,t in d.items():
+        key = s if bot_num=="1" else s+"__2"
+        rows += (f'<tr id="row-{bot_num}-{s}">'
+                 f'<td><b>{s}</b></td>'
+                 f'<td>&#8377;{t["entry"]}</td>'
+                 f'<td>{t["qty"]}</td>'
+                 f'<td style="color:#ff4d4d;">&#8377;{t["sl"]}</td>'
+                 f'<td style="color:#00c896;">&#8377;{t["tp"]}</td>'
+                 f'<td>&#8377;{t["capital_used"]}</td>'
+                 f'<td id="ltp-{bot_num}-{s}" style="font-weight:700;">—</td>'
+                 f'<td id="upnl-{bot_num}-{s}">—</td>'
+                 f'<td>{t["entry_time"]}</td>'
+                 f'<td><button onclick="closePos(\'{bot_num}\',\'{s}\',this)" '
+                 f'style="background:#da3633;border:none;border-radius:5px;color:#fff;'
+                 f'padding:3px 10px;font-size:12px;cursor:pointer;">Close</button></td>'
+                 f'</tr>')
+    return rows
 
 def tbl_closed(rows):
     if not rows: return '<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px;">No closed trades today</td></tr>'
@@ -629,6 +685,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
 .ng{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
 .nt{font-size:12px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin:16px 0 8px;}
 .nifty-bar{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;}
+.ltp-status{font-size:11px;color:#8b949e;margin-bottom:10px;}
 @media(max-width:700px){{.sg{{grid-template-columns:repeat(3,1fr);}}.ng{{grid-template-columns:1fr;}}}}
 """
 
@@ -637,7 +694,6 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<meta http-equiv="refresh" content="30"/>
 <title>Chartink Bot Dashboard</title>
 <style>{CSS}</style>
 </head>
@@ -649,7 +705,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
     <span class="badge">{mkt_status}</span>
     <span class="badge" style="color:{nifty_c};">Nifty &#8377;{nse.get('nifty_ltp',0)} {nifty_sg}{nse.get('nifty_chg',0)}%</span>
   </div>
-  <div class="tr"><div>&#128336; {time_str()}</div><div>&#8635; Auto-refresh 30s</div></div>
+  <div class="tr"><div>&#128336; {time_str()}</div><div id="ltp-ts" class="ltp-status">&#8635; Fetching live prices...</div></div>
 </div>
 <div class="con">
 <div class="mt">
@@ -685,8 +741,8 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
       <button class="tb" onclick="showT('s1','hist',this)">History</button>
     </div>
     <div id="s1-open" class="tp active"><div class="tw"><table>
-      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Capital</th><th>Time</th></tr></thead>
-      <tbody>{tbl_open(open_trades)}</tbody></table></div></div>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Capital</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody id="open-tbody-1">{tbl_open(open_trades,"1")}</tbody></table></div></div>
     <div id="s1-closed" class="tp"><div class="tw"><table>
       <thead><tr><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
       <tbody>{tbl_closed(t1)}</tbody></table></div></div>
@@ -715,8 +771,8 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
       <button class="tb" onclick="showT('s2','hist',this)">History</button>
     </div>
     <div id="s2-open" class="tp active"><div class="tw"><table>
-      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Capital</th><th>Time</th></tr></thead>
-      <tbody>{tbl_open(open_trades2)}</tbody></table></div></div>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Capital</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody id="open-tbody-2">{tbl_open(open_trades2,"2")}</tbody></table></div></div>
     <div id="s2-closed" class="tp"><div class="tw"><table>
       <thead><tr><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
       <tbody>{tbl_closed(t2)}</tbody></table></div></div>
@@ -773,6 +829,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
 
 </div>
 <script>
+// ── Tab navigation with hash persistence ──────
 function showMain(id,btn){{
   document.querySelectorAll('.mtp').forEach(function(p){{p.classList.remove('active');}});
   document.querySelectorAll('.mtb').forEach(function(b){{b.classList.remove('active');}});
@@ -798,6 +855,8 @@ function doScan(btn){{
   btn.textContent='⏳ Scanning...'; btn.disabled=true;
   fetch('/scan').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
 }}
+
+// ── Restore tab from hash on page load ────────
 (function(){{
   var hash=window.location.hash||''; var parts=hash.split('|');
   var mainTab='trading';
@@ -822,6 +881,55 @@ function doScan(btn){{
     }}
   }});
 }})();
+
+// ── Live Price Fetcher (every 15s) ────────────
+function fetchPrices(){{
+  fetch('/prices')
+    .then(function(r){{return r.json();}})
+    .then(function(data){{
+      for(var key in data){{
+        var info = data[key];
+        var bot  = info.bot;
+        var sym  = key.replace('__2','');
+        var ltpEl  = document.getElementById('ltp-'+bot+'-'+sym);
+        var upnlEl = document.getElementById('upnl-'+bot+'-'+sym);
+        if(ltpEl) ltpEl.textContent = '&#8377;'+info.price;
+        if(upnlEl){{
+          var pnl = info.unrealised_pnl;
+          var pct = info.pct;
+          var col = pnl>=0?'#00c896':'#ff4d4d';
+          var sg  = pnl>=0?'+':'';
+          upnlEl.innerHTML = '<span style="color:'+col+';font-weight:700;">'+sg+'&#8377;'+pnl+' ('+sg+pct+'%)</span>';
+        }}
+      }}
+      var ts = new Date().toLocaleTimeString('en-IN');
+      document.getElementById('ltp-ts').textContent = '&#8635; Prices updated '+ts;
+    }})
+    .catch(function(){{
+      document.getElementById('ltp-ts').textContent = '&#9888; Price fetch failed';
+    }});
+}}
+fetchPrices();
+setInterval(fetchPrices, 15000);
+
+// ── Manual Close ──────────────────────────────
+function closePos(bot, sym, btn){{
+  if(!confirm('Close '+sym+' position?')) return;
+  btn.disabled=true; btn.textContent='...';
+  fetch('/close/'+bot+'/'+sym, {{method:'POST'}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      if(d.status==='closed'){{
+        var row=document.getElementById('row-'+bot+'-'+sym);
+        if(row) row.remove();
+        alert('✅ '+sym+' closed @ &#8377;'+d.price);
+      }} else {{
+        alert('❌ Error: '+JSON.stringify(d));
+        btn.disabled=false; btn.textContent='Close';
+      }}
+    }})
+    .catch(function(){{btn.disabled=false; btn.textContent='Close';}});
+}}
 </script>
 </body>
 </html>"""
