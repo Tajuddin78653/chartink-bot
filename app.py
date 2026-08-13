@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+rom flask import Flask, request, jsonify
 from datetime import datetime, time as dtime
 import pytz, os, time, threading, requests, csv
 
@@ -39,6 +39,23 @@ _nse_cache = {}; _nse_cache_time = 0; NSE_CACHE_TTL = 120
 
 # ── Signal Engine ─────────────────────────────
 _last_signals = []; _last_scan_time = "Never"
+
+# ── Pro Engine ────────────────────────────────
+_pro_signals       = []
+_pro_scan_time     = "Never"
+_pro_nifty_dir     = "FLAT"
+PRO_ADX_MIN        = 25
+PRO_RSI_BUY_LO     = 55;  PRO_RSI_BUY_HI  = 75
+PRO_RSI_SELL_LO    = 25;  PRO_RSI_SELL_HI = 45
+PRO_VOL_MULT       = 1.5
+PRO_BODY_MIN       = 0.50
+PRO_SHADOW_MAX     = 0.40
+PRO_ATR_SL         = 1.5
+PRO_ATR_TP1        = 2.0
+PRO_ATR_TP2        = 3.5
+PRO_MIN_RR         = 1.5
+PRO_TRADE_START    = dtime(9, 30)
+PRO_TRADE_END      = dtime(14, 30)
 
 # ── Nifty 50 ──────────────────────────────────
 NIFTY50 = [
@@ -331,6 +348,214 @@ def run_signal_scan():
     print(f"✅ Scan done BUY:{b} SELL:{s} SKIP:{len(results)-b-s}")
 
 # ─────────────────────────────────────────────
+#  PRO ENGINE — 7-Filter Confluence Strategy
+# ─────────────────────────────────────────────
+def calc_rsi(series, period=14):
+    """Pure-pandas RSI calculation."""
+    try:
+        delta  = series.diff()
+        gain   = delta.clip(lower=0).rolling(period).mean()
+        loss   = (-delta.clip(upper=0)).rolling(period).mean()
+        rs     = gain / loss.replace(0, 1e-10)
+        return 100 - (100 / (1 + rs))
+    except: return None
+
+def pro_check_signal(symbol, nifty_dir):
+    """
+    7-Filter Confluence — returns dict with signal, score (0-7), details.
+    BUY  needs score == 7  (all filters green)
+    SELL needs score == 7  (all filters green, mirrored)
+    """
+    result = {
+        "symbol": symbol, "signal": "SKIP", "score": 0,
+        "entry": 0, "sl": 0, "tp1": 0, "tp2": 0,
+        "rr": 0, "atr": 0, "rsi": 0, "adx": 0,
+        "reason": "", "filters": []
+    }
+    # ── Fetch candles ──────────────────────────
+    df = fetch_candles(symbol)
+    if df is None:
+        result["reason"] = "No data"; return result
+
+    # ── Compute indicators ─────────────────────
+    df["ema13"] = calc_ema(df["close"], 13)
+    df["ema50"] = calc_ema(df["close"], 50)
+    df["atr"]   = calc_atr(df, 14)
+    adx_s       = calc_adx(df, 14)
+    df["adx"]   = adx_s if adx_s is not None else 0.0
+    rsi_s       = calc_rsi(df["close"], 14)
+    df["rsi"]   = rsi_s if rsi_s is not None else 50.0
+    # Volume moving average
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    df = df.dropna(subset=["ema13","ema50","atr","adx","rsi","vol_ma"])
+    if len(df) < 3:
+        result["reason"] = "Not enough data"; return result
+
+    cur  = df.iloc[-1]; prev = df.iloc[-2]
+    close= float(cur["close"]); opn  = float(cur["open"])
+    high = float(cur["high"]);  low  = float(cur["low"])
+    e13c = float(cur["ema13"]); e50c = float(cur["ema50"])
+    e13p = float(prev["ema13"]);e50p = float(prev["ema50"])
+    atr  = float(cur["atr"]);   adx  = float(cur["adx"])
+    rsi  = float(cur["rsi"]);   vol  = float(cur["volume"])
+    vol_ma = float(cur["vol_ma"])
+
+    result["entry"] = round(close, 2)
+    result["atr"]   = round(atr, 2)
+    result["rsi"]   = round(rsi, 1)
+    result["adx"]   = round(adx, 1)
+
+    # ── Time window filter (skip opening & closing noise) ──
+    t_now = now_ist()
+    in_window = PRO_TRADE_START <= t_now <= PRO_TRADE_END
+
+    # ── Determine direction ────────────────────
+    crossed_up   = (e13p <= e50p) and (e13c > e50c)
+    crossed_down = (e13p >= e50p) and (e13c < e50c)
+    direction    = "BUY" if crossed_up else ("SELL" if crossed_down else None)
+    if direction is None:
+        result["reason"] = "No EMA crossover"; return result
+
+    # ── 7 Filters ──────────────────────────────
+    filters = []
+    score   = 0
+
+    # F1: EMA trend aligned
+    f1 = (e13c > e50c) if direction=="BUY" else (e13c < e50c)
+    filters.append(("EMA Trend",    "✅" if f1 else "❌",
+                    f"EMA13={'above' if e13c>e50c else 'below'} EMA50"))
+    if f1: score += 1
+
+    # F2: Fresh EMA crossover
+    f2 = crossed_up if direction=="BUY" else crossed_down
+    filters.append(("EMA Crossover","✅" if f2 else "❌", "Fresh cross this candle"))
+    if f2: score += 1
+
+    # F3: ADX strength
+    f3 = adx >= PRO_ADX_MIN
+    filters.append(("ADX Strength", "✅" if f3 else "❌", f"ADX={adx:.1f} (need >{PRO_ADX_MIN})"))
+    if f3: score += 1
+
+    # F4: RSI momentum
+    if direction == "BUY":
+        f4 = PRO_RSI_BUY_LO <= rsi <= PRO_RSI_BUY_HI
+        filters.append(("RSI Momentum","✅" if f4 else "❌",
+                        f"RSI={rsi:.1f} (need {PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI})"))
+    else:
+        f4 = PRO_RSI_SELL_LO <= rsi <= PRO_RSI_SELL_HI
+        filters.append(("RSI Momentum","✅" if f4 else "❌",
+                        f"RSI={rsi:.1f} (need {PRO_RSI_SELL_LO}-{PRO_RSI_SELL_HI})"))
+    if f4: score += 1
+
+    # F5: Volume surge
+    f5 = vol >= PRO_VOL_MULT * vol_ma if vol_ma > 0 else False
+    filters.append(("Volume Surge", "✅" if f5 else "❌",
+                    f"Vol={int(vol):,} vs avg={int(vol_ma):,} (need {PRO_VOL_MULT}x)"))
+    if f5: score += 1
+
+    # F6: Nifty direction aligned
+    f6 = (nifty_dir == "UP") if direction=="BUY" else (nifty_dir == "DOWN")
+    filters.append(("Nifty Aligned","✅" if f6 else "❌", f"Nifty={nifty_dir}"))
+    if f6: score += 1
+
+    # F7: Strong candle quality
+    rng = high - low
+    if rng > 0:
+        body   = abs(close - opn) / rng
+        shadow = ((high - max(close,opn)) + (min(close,opn) - low)) / rng
+        f7 = (body >= PRO_BODY_MIN) and (shadow <= PRO_SHADOW_MAX)
+        filters.append(("Candle Quality","✅" if f7 else "❌",
+                        f"Body={body:.0%} Shadow={shadow:.0%}"))
+    else:
+        f7 = False
+        filters.append(("Candle Quality","❌","Doji candle"))
+    if f7: score += 1
+
+    result["score"]   = score
+    result["filters"] = filters
+
+    # ── Require 7/7 to fire ────────────────────
+    if score < 7:
+        failed = [f[0] for f in filters if f[1]=="❌"]
+        result["reason"] = f"Score {score}/7 — Failed: {', '.join(failed)}"
+        return result
+
+    # ── Time window check ──────────────────────
+    if not in_window:
+        result["reason"] = f"Score 7/7 but outside trade window (9:30-14:30)"
+        result["signal"] = "WATCH"   # show as watchlist
+        return result
+
+    # ── Compute SL / TP / R:R ─────────────────
+    if direction == "BUY":
+        sl  = round(close - PRO_ATR_SL  * atr, 2)
+        tp1 = round(close + PRO_ATR_TP1 * atr, 2)
+        tp2 = round(close + PRO_ATR_TP2 * atr, 2)
+    else:
+        sl  = round(close + PRO_ATR_SL  * atr, 2)
+        tp1 = round(close - PRO_ATR_TP1 * atr, 2)
+        tp2 = round(close - PRO_ATR_TP2 * atr, 2)
+
+    risk   = abs(close - sl)
+    reward = abs(tp1   - close)
+    rr     = round(reward / risk, 2) if risk > 0 else 0
+
+    # ── Minimum R:R check ──────────────────────
+    if rr < PRO_MIN_RR:
+        result["reason"] = f"Score 7/7 but R:R={rr} < {PRO_MIN_RR} minimum"
+        return result
+
+    result.update({
+        "signal": direction,
+        "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr,
+        "reason": f"7/7 ✅ | ADX={adx:.1f} RSI={rsi:.1f} Vol={int(vol/vol_ma*100) if vol_ma else 0}% R:R=1:{rr}"
+    })
+    return result
+
+def run_pro_scan():
+    global _pro_signals, _pro_scan_time, _pro_nifty_dir
+    print(f"🎯 Pro scan {time_str()}")
+    nifty_dir = get_nifty_direction()
+    _pro_nifty_dir = nifty_dir
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = pro_check_signal(symbol, nifty_dir)
+            r["market_dir"] = nifty_dir
+            results.append(r)
+        except Exception as e:
+            results.append({
+                "symbol": symbol, "signal": "SKIP", "score": 0,
+                "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "rr": 0,
+                "atr": 0, "rsi": 0, "adx": 0,
+                "reason": str(e), "filters": [], "market_dir": nifty_dir
+            })
+    # Sort: BUY first, SELL next, WATCH, then SKIP by score desc
+    order = {"BUY":0,"SELL":1,"WATCH":2,"SKIP":3}
+    results.sort(key=lambda x: (order.get(x["signal"],3), -x["score"]))
+    _pro_signals   = results
+    _pro_scan_time = time_str()
+    buys  = sum(1 for r in results if r["signal"]=="BUY")
+    sells = sum(1 for r in results if r["signal"]=="SELL")
+    watch = sum(1 for r in results if r["signal"]=="WATCH")
+    print(f"🎯 Pro scan done BUY:{buys} SELL:{sells} WATCH:{watch}")
+    # ── Send Telegram alerts for strong signals ─
+    for r in results:
+        if r["signal"] in ("BUY","SELL"):
+            emoji = "🟢" if r["signal"]=="BUY" else "🔴"
+            send(f"{emoji} <b>PRO ENGINE — {r['signal']}</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                 f"📌 Stock  : <b>{r['symbol']}</b>\n"
+                 f"💰 Entry  : ₹{r['entry']}\n"
+                 f"🔴 SL     : ₹{r['sl']}\n"
+                 f"🎯 TP1    : ₹{r['tp1']} (50% exit)\n"
+                 f"🚀 TP2    : ₹{r['tp2']} (trail 50%)\n"
+                 f"📊 Score  : {r['score']}/7\n"
+                 f"⚖️  R:R    : 1:{r['rr']}\n"
+                 f"🕐 {time_str()}",
+                 token=BOT2_TOKEN, chat_id=BOT2_CHAT_ID)
+
+# ─────────────────────────────────────────────
 #  BOT 1 — tazbul
 # ─────────────────────────────────────────────
 def open_trade(symbol, price):
@@ -454,6 +679,7 @@ def run_monitor():
                 if cur_min%5==0 and cur_min!=last_scan_min:
                     last_scan_min=cur_min
                     threading.Thread(target=run_signal_scan,daemon=True).start()
+                    threading.Thread(target=run_pro_scan,daemon=True).start()
         except Exception as e: print(f"❌ Monitor: {e}")
         time.sleep(60)
 
@@ -525,6 +751,11 @@ def receive_alert2():
 def manual_scan():
     threading.Thread(target=run_signal_scan,daemon=True).start()
     return jsonify({"status":"scan started"}),200
+
+@app.route("/pro-scan",methods=["GET"])
+def pro_scan_route():
+    threading.Thread(target=run_pro_scan,daemon=True).start()
+    return jsonify({"status":"pro scan started"}),200
 
 @app.route("/nse-data",methods=["GET"])
 def nse_data_api():
@@ -606,6 +837,52 @@ def tbl_hist(rows):
         out+=f'<tr><td>{r["date"]}</td><td><b>{r["symbol"]}</b></td><td>&#8377;{r["entry"]}</td><td>&#8377;{r["exit"]}</td><td>{r["qty"]}</td><td style="color:{c};font-weight:700;">{sg}&#8377;{v}</td><td>{r.get("reason","")}</td></tr>'
     return out
 
+def tbl_pro_signals(sigs):
+    """Build Pro Engine table rows — score bar + dual TP + R:R."""
+    buys  = [s for s in sigs if s["signal"]=="BUY"]
+    sells = [s for s in sigs if s["signal"]=="SELL"]
+    watch = [s for s in sigs if s["signal"]=="WATCH"]
+    skips = [s for s in sigs if s["signal"]=="SKIP"]
+    out   = ""
+    def score_bar(sc):
+        bars = ""
+        for i in range(7):
+            col = "#00c896" if i < sc else "#30363d"
+            bars += f'<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:{col};margin-right:2px;"></span>'
+        return f'<span title="{sc}/7">{bars}</span>'
+    def row(s, sig_label, sig_color):
+        rr_c = "#00c896" if s["rr"]>=2 else ("#f0b429" if s["rr"]>=1.5 else "#ff4d4d")
+        return (f'<tr>'
+                f'<td><b style="color:{sig_color};">{sig_label}</b></td>'
+                f'<td><b>{s["symbol"]}</b></td>'
+                f'<td>{score_bar(s["score"])} <span style="font-size:11px;color:#8b949e;">{s["score"]}/7</span></td>'
+                f'<td>&#8377;{s["entry"]}</td>'
+                f'<td style="color:#ff4d4d;">&#8377;{s["sl"]}</td>'
+                f'<td style="color:#58a6ff;">&#8377;{s["tp1"]}</td>'
+                f'<td style="color:#a78bfa;">&#8377;{s["tp2"]}</td>'
+                f'<td style="color:{rr_c};font-weight:700;">1:{s["rr"]}</td>'
+                f'<td style="color:#58a6ff;">{s["rsi"]}</td>'
+                f'<td style="color:#f0b429;">{s["adx"]}</td>'
+                f'<td style="font-size:11px;color:#8b949e;">{s["reason"][:60]}</td>'
+                f'</tr>')
+    for s in buys:  out += row(s, "&#9650; BUY",   "#00c896")
+    for s in sells: out += row(s, "&#9660; SELL",  "#ff4d4d")
+    for s in watch: out += row(s, "&#128064; WATCH","#f0b429")
+    for s in skips[:10]:
+        sc = s["score"]
+        out += (f'<tr style="opacity:0.35;">'
+                f'<td><b style="color:#8b949e;">&#8213; SKIP</b></td>'
+                f'<td>{s["symbol"]}</td>'
+                f'<td>{score_bar(sc)} <span style="font-size:11px;color:#8b949e;">{sc}/7</span></td>'
+                f'<td>&#8377;{s["entry"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td>'
+                f'<td style="color:#58a6ff;">{s["rsi"]}</td>'
+                f'<td style="color:#f0b429;">{s["adx"]}</td>'
+                f'<td style="font-size:11px;color:#8b949e;">{s["reason"][:60]}</td>'
+                f'</tr>')
+    if not out:
+        out = '<tr><td colspan="11" style="text-align:center;color:#8b949e;padding:20px;">No scan results — click &#9654; Pro Scan or wait for auto-scan every 5 min</td></tr>'
+    return out, len(buys), len(sells), len(watch), len(skips)
+
 def tbl_signals(sigs):
     buys=[s for s in sigs if s["signal"]=="BUY"]
     sells=[s for s in sigs if s["signal"]=="SELL"]
@@ -672,6 +949,9 @@ def dashboard():
 
     nse=fetch_nse_data()
     sig_rows,nb,ns,nsk=tbl_signals(_last_signals)
+    pro_rows,npb,nps,npw,npsk=tbl_pro_signals(_pro_signals)
+    pro_dir_c   = "#00c896" if _pro_nifty_dir=="UP" else ("#ff4d4d" if _pro_nifty_dir=="DOWN" else "#8b949e")
+    pro_dir_ico = "&#9650;" if _pro_nifty_dir=="UP" else ("&#9660;" if _pro_nifty_dir=="DOWN" else "&#8213;")
     pc1="#00c896" if net1>=0 else "#ff4d4d"; pc2="#00c896" if net2>=0 else "#ff4d4d"
     nifty_c="#00c896" if nse.get("nifty_chg",0)>=0 else "#ff4d4d"
     nifty_sg="+" if nse.get("nifty_chg",0)>=0 else ""
@@ -740,6 +1020,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
   <button class="mtb active" onclick="showMain('trading',this)">&#127939; Trading Bots</button>
   <button class="mtb" onclick="showMain('signals',this)">&#129302; Signal Engine <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{nb}B {ns}S</span></button>
   <button class="mtb" onclick="showMain('nse',this)">&#128200; NSE Market</button>
+  <button class="mtb" onclick="showMain('pro',this)">&#127919; Pro Engine <span style="background:#9333ea;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{npb}B {nps}S</span></button>
 </div>
 
 <!-- TRADING BOTS -->
@@ -855,7 +1136,84 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
   </div>
 </div>
 
-<!-- CHARTINK GUIDE -->
+<!-- PRO ENGINE -->
+<div id="main-pro" class="mtp">
+
+  <!-- Scan bar -->
+  <div class="scanbar" style="background:#1a1025;border-color:#6d28d9;">
+    <button class="scanbtn" style="background:#7c3aed;" onclick="doProScan(this)">&#9654; Pro Scan</button>
+    <span style="font-size:13px;">Last: <b>{_pro_scan_time}</b></span>
+    <span style="font-size:13px;">Nifty: <b style="color:{pro_dir_c};">{pro_dir_ico} {_pro_nifty_dir}</b></span>
+    <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{npb}</b></span>
+    <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{nps}</b></span>
+    <span style="font-size:13px;">&#128064; Watch:<b style="color:#f0b429;">{npw}</b></span>
+    <span style="font-size:13px;">&#8213; Skip:<b style="color:#8b949e;">{npsk}</b></span>
+  </div>
+
+  <!-- Strategy info bar -->
+  <div class="ib" style="background:#1a1025;border-color:#6d28d9;">
+    Strategy:<span style="color:#a78bfa;">7-Filter Confluence</span>
+    Universe:<span>Nifty 50</span>
+    TF:<span>5-min</span>
+    Filters:<span>EMA&#43;ADX&#43;RSI&#43;Volume&#43;Candle&#43;Nifty&#43;RR</span>
+    ADX:<span>&gt;{PRO_ADX_MIN}</span>
+    RSI BUY:<span>{PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI}</span>
+    Vol:<span>{PRO_VOL_MULT}x avg</span>
+    SL:<span>ATR&#215;{PRO_ATR_SL}</span>
+    TP1:<span>ATR&#215;{PRO_ATR_TP1}</span>
+    TP2:<span>ATR&#215;{PRO_ATR_TP2}</span>
+    Window:<span>9:30-14:30</span>
+    Auto:<span>Every 5min</span>
+  </div>
+
+  <!-- 7 Filter legend -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:18px;">
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F1</b> <span style="color:#c9d1d9;">EMA Trend</span><br/><span style="color:#8b949e;">EMA13 aligned with EMA50</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F2</b> <span style="color:#c9d1d9;">EMA Crossover</span><br/><span style="color:#8b949e;">Fresh cross this candle</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F3</b> <span style="color:#c9d1d9;">ADX &gt; {PRO_ADX_MIN}</span><br/><span style="color:#8b949e;">Strong trend, not sideways</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F4</b> <span style="color:#c9d1d9;">RSI {PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI}</span><br/><span style="color:#8b949e;">Momentum not overbought</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F5</b> <span style="color:#c9d1d9;">Volume {PRO_VOL_MULT}x avg</span><br/><span style="color:#8b949e;">Big player confirmation</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F6</b> <span style="color:#c9d1d9;">Nifty Aligned</span><br/><span style="color:#8b949e;">Market direction match</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F7</b> <span style="color:#c9d1d9;">Candle Quality</span><br/><span style="color:#8b949e;">Body&gt;50% Shadow&lt;40%</span>
+    </div>
+  </div>
+
+  <!-- Results table -->
+  <div class="tw"><table>
+    <thead>
+      <tr>
+        <th>Signal</th><th>Symbol</th><th>Score</th>
+        <th>Entry &#8377;</th><th>SL &#8377;</th>
+        <th>TP1 &#8377;</th><th>TP2 &#8377;</th>
+        <th>R:R</th><th>RSI</th><th>ADX</th><th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>{pro_rows}</tbody>
+  </table></div>
+
+  <!-- R:R colour legend -->
+  <div style="display:flex;gap:18px;margin-top:12px;font-size:12px;color:#8b949e;flex-wrap:wrap;">
+    <span>R:R colour: </span>
+    <span style="color:#00c896;">&#9632; &#8805;2.0 (Excellent)</span>
+    <span style="color:#f0b429;">&#9632; &#8805;1.5 (Good)</span>
+    <span style="color:#ff4d4d;">&#9632; &lt;1.5 (Weak)</span>
+    <span style="color:#8b949e;">| Score bar: 7 green = 7/7 filters passed</span>
+  </div>
+</div>
+
 </div>
 <script>
 // ── Tab navigation with hash persistence ──────
@@ -883,6 +1241,10 @@ function showT(s,name,btn){{
 function doScan(btn){{
   btn.textContent='⏳ Scanning...'; btn.disabled=true;
   fetch('/scan').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
+}}
+function doProScan(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/pro-scan').then(function(){{setTimeout(function(){{location.reload();}},12000);}});
 }}
 
 // ── Restore tab from hash on page load ────────
