@@ -14,8 +14,8 @@ SL_PERCENT        = 1.0
 TP_PERCENT        = 1.5
 
 # ── Bot 2 — TazAmol-Test1 ─────────────────────
-BOT2_TOKEN        = "8030391810:AAFkdVuFY32iGpNmIVCp-A96jpVlufUTJzE"
-BOT2_CHAT_ID      = "527293574"
+BOT2_TOKEN        = os.environ.get("BOT2_TOKEN", "")
+BOT2_CHAT_ID      = os.environ.get("BOT2_CHAT_ID", "")
 BOT2_SL           = 1.0
 BOT2_TP           = 1.0
 BOT2_CAPITAL      = 10000
