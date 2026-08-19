@@ -46,6 +46,15 @@ _1350_signals = []; _1350_scan_time = "Never"
 # ── Gap D/U Strategy ──────────────────────────
 _gap_signals = []; _gap_scan_time = "Never"
 
+# 🕯️ Supertrend+ADX Strategy ════════════════════════════════
+_st_signals       = []
+_st_scan_time     = "Never"
+ST_PERIOD         = 7        # Supertrend period (optimised for 1-min)
+ST_MULTIPLIER     = 3.0      # Supertrend multiplier
+ST_ADX_MIN        = 25       # ADX threshold — filters ranging markets
+ST_ATR_SL         = 1.5      # SL = entry ± ATR × this
+ST_ATR_TP         = 2.5      # TP = entry ± ATR × this
+
 # ── Pro Engine ────────────────────────────────
 _pro_signals       = []
 _pro_scan_time     = "Never"
@@ -246,6 +255,16 @@ def fetch_candles(symbol):
         import yfinance as yf
         df = yf.Ticker(f"{symbol}.NS").history(period="5d",interval="5m")
         if df is None or len(df)<60: return None
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+        return df[["open","high","low","close","volume"]].copy()
+    except: return None
+
+def fetch_candles_1m(symbol):
+    """Fetch 1-minute candles — used exclusively by Supertrend+ADX strategy."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(f"{symbol}.NS").history(period="5d", interval="1m")
+        if df is None or len(df) < 50: return None
         df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
         return df[["open","high","low","close","volume"]].copy()
     except: return None
@@ -748,6 +767,164 @@ def run_pro_scan():
 # ─────────────────────────────────────────────
 #  BOT 1 — tazbul
 # ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  SUPERTREND + ADX STRATEGY  (1-min candles)
+# ═══════════════════════════════════════════════════════════════
+def calc_supertrend(df, period, multiplier):
+    """
+    Returns df with two new columns:
+      ST_val  — supertrend line value
+      ST_dir  — 'up' (bullish) or 'down' (bearish)
+    Uses ATR-based upper/lower bands, classic SuperTrend algorithm.
+    """
+    import numpy as np
+    high = df["high"].values
+    low  = df["low"].values
+    close= df["close"].values
+    n    = len(df)
+
+    # True Range
+    tr = np.zeros(n)
+    for i in range(1, n):
+        tr[i] = max(high[i]-low[i],
+                    abs(high[i]-close[i-1]),
+                    abs(low[i] -close[i-1]))
+
+    # ATR via Wilder smoothing
+    atr = np.zeros(n)
+    atr[period] = np.mean(tr[1:period+1])
+    for i in range(period+1, n):
+        atr[i] = (atr[i-1]*(period-1) + tr[i]) / period
+
+    # Basic bands
+    ub = (high + low) / 2 + multiplier * atr
+    lb = (high + low) / 2 - multiplier * atr
+
+    # Final bands & SuperTrend
+    final_ub = np.copy(ub)
+    final_lb = np.copy(lb)
+    st       = np.zeros(n)
+    direction= ["up"] * n   # up = bullish (price above ST)
+
+    for i in range(period+1, n):
+        # Final upper band
+        if ub[i] < final_ub[i-1] or close[i-1] > final_ub[i-1]:
+            final_ub[i] = ub[i]
+        else:
+            final_ub[i] = final_ub[i-1]
+        # Final lower band
+        if lb[i] > final_lb[i-1] or close[i-1] < final_lb[i-1]:
+            final_lb[i] = lb[i]
+        else:
+            final_lb[i] = final_lb[i-1]
+        # SuperTrend value
+        if st[i-1] == final_ub[i-1] and close[i] <= final_ub[i]:
+            st[i] = final_ub[i]; direction[i] = "down"
+        elif st[i-1] == final_ub[i-1] and close[i] > final_ub[i]:
+            st[i] = final_lb[i]; direction[i] = "up"
+        elif st[i-1] == final_lb[i-1] and close[i] >= final_lb[i]:
+            st[i] = final_lb[i]; direction[i] = "up"
+        elif st[i-1] == final_lb[i-1] and close[i] < final_lb[i]:
+            st[i] = final_ub[i]; direction[i] = "down"
+        else:
+            st[i] = final_lb[i]; direction[i] = "up"
+
+    df = df.copy()
+    df["ST_val"] = st
+    df["ST_dir"] = direction
+    df["ST_atr"] = atr
+    return df
+
+
+def check_supertrend_signal(symbol):
+    """
+    1-min Supertrend + ADX signal check.
+    BUY  : ST flips down→up  AND  ADX ≥ ST_ADX_MIN
+    SELL : ST flips up→down  AND  ADX ≥ ST_ADX_MIN
+    Returns dict with signal, entry, sl, tp, atr, adx, reason.
+    """
+    res = {"symbol": symbol, "signal": "SKIP",
+           "entry": 0, "sl": 0, "tp": 0, "atr": 0, "adx": 0, "reason": ""}
+    df = fetch_candles_1m(symbol)
+    if df is None:
+        res["reason"] = "No 1m data"; return res
+    if len(df) < ST_PERIOD + 10:
+        res["reason"] = f"Not enough candles ({len(df)})"; return res
+
+    try:
+        df = calc_supertrend(df, ST_PERIOD, ST_MULTIPLIER)
+    except Exception as e:
+        res["reason"] = f"ST calc error: {e}"; return res
+
+    # ADX on 1-min candles (14-period)
+    adx_s = calc_adx(df, 14)
+    adx   = float(adx_s.iloc[-1]) if adx_s is not None else 0.0
+
+    cur  = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    close    = float(cur["close"])
+    atr_val  = float(cur["ST_atr"])
+    cur_dir  = cur["ST_dir"]
+    prev_dir = prev["ST_dir"]
+
+    res["entry"] = round(close, 2)
+    res["atr"]   = round(atr_val, 2)
+    res["adx"]   = round(adx, 1)
+
+    if adx < ST_ADX_MIN:
+        res["reason"] = f"Ranging — ADX={adx:.1f} < {ST_ADX_MIN}"; return res
+
+    flipped_up   = (prev_dir == "down" and cur_dir == "up")
+    flipped_down = (prev_dir == "up"   and cur_dir == "down")
+
+    if not flipped_up and not flipped_down:
+        res["reason"] = f"No flip — ST={cur_dir} | ADX={adx:.1f}"; return res
+
+    if flipped_up:
+        sl = round(close - ST_ATR_SL * atr_val, 2)
+        tp = round(close + ST_ATR_TP * atr_val, 2)
+        res.update({"signal": "BUY", "sl": sl, "tp": tp,
+                    "reason": f"ST flip down→up | ADX={adx:.1f} | 1m"})
+    else:
+        sl = round(close + ST_ATR_SL * atr_val, 2)
+        tp = round(close - ST_ATR_TP * atr_val, 2)
+        res.update({"signal": "SELL", "sl": sl, "tp": tp,
+                    "reason": f"ST flip up→down | ADX={adx:.1f} | 1m"})
+    return res
+
+
+def run_st_scan():
+    global _st_signals, _st_scan_time
+    print(f"🕯️ ST+ADX Scan {time_str()}")
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = check_supertrend_signal(symbol)
+            results.append(r)
+            if r["signal"] in ("BUY", "SELL"):
+                emoji = "🟢" if r["signal"] == "BUY" else "🔴"
+                send(f"{emoji} <b>SUPERTREND+ADX — {r['signal']}</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                     f"📌 Stock  : <b>{symbol}</b>\n"
+                     f"💵 Entry  : ₹{r['entry']}\n"
+                     f"🔴 SL     : ₹{r['sl']}\n"
+                     f"🎯 TP     : ₹{r['tp']}\n"
+                     f"📊 ADX    : {r['adx']} | ATR: {r['atr']}\n"
+                     f"💡 Reason : {r['reason']}\n"
+                     f"⏰ {time_str()}")
+        except Exception as e:
+            results.append({"symbol": symbol, "signal": "SKIP",
+                            "entry": 0, "sl": 0, "tp": 0,
+                            "atr": 0, "adx": 0, "reason": str(e)})
+    _st_signals   = results
+    _st_scan_time = time_str()
+    buys  = sum(1 for r in results if r["signal"] == "BUY")
+    sells = sum(1 for r in results if r["signal"] == "SELL")
+    print(f"✅ ST+ADX scan done BUY:{buys} SELL:{sells} SKIP:{len(results)-buys-sells}")
+
+
+# ═══════════════════════════════════════════════════════════════
 def open_trade(symbol, price):
     if symbol in open_trades or symbol in traded_today: return
     trade=calculate_trade(symbol,price,SL_PERCENT,TP_PERCENT,CAPITAL_PER_TRADE)
@@ -872,6 +1049,7 @@ def run_monitor():
                     threading.Thread(target=run_pro_scan,daemon=True).start()
                     threading.Thread(target=run_1350_scan,daemon=True).start()
                     threading.Thread(target=run_gap_scan,daemon=True).start()
+                    threading.Thread(target=run_st_scan,daemon=True).start()
         except Exception as e: print(f"❌ Monitor: {e}")
         time.sleep(60)
 
@@ -951,6 +1129,11 @@ def scan_gap_route():
 def pro_scan_route():
     threading.Thread(target=run_pro_scan,daemon=True).start()
     return jsonify({"status":"pro scan started"}),200
+
+@app.route("/scan-supertrend",methods=["GET"])
+def scan_supertrend_route():
+    threading.Thread(target=run_st_scan,daemon=True).start()
+    return jsonify({"status":"Supertrend+ADX scan started"}),200
 
 @app.route("/nse-data",methods=["GET"])
 def nse_data_api():
@@ -1169,6 +1352,21 @@ def dashboard():
         return out,len(buys),len(sells)
     rows_1350,nb_1350,ns_1350=tbl_1350(_1350_signals)
     rows_gap,nb_gap,ns_gap=tbl_gap(_gap_signals)
+    # ── Supertrend+ADX table ──
+    def tbl_st(sigs):
+        buys =[s for s in sigs if s["signal"]=="BUY"]
+        sells=[s for s in sigs if s["signal"]=="SELL"]
+        skips=[s for s in sigs if s["signal"]=="SKIP"]
+        out=""
+        for s in buys:
+            out+=f'<tr><td><b style="color:#00c896;">&#9650; BUY</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s["adx"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in sells:
+            out+=f'<tr><td><b style="color:#ff4d4d;">&#9660; SELL</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s["adx"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in skips[:10]:
+            out+=f'<tr style="opacity:0.35;"><td><b style="color:#8b949e;">&#8213; SKIP</b></td><td>{s["symbol"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        if not out: out='<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No results — click Scan or wait for auto-scan every 5min</td></tr>'
+        return out,len(buys),len(sells)
+    rows_st,nb_st,ns_st=tbl_st(_st_signals)
     nse_adv=nse.get("advances",0); nse_dec=nse.get("declines",0)
     ad_ratio_now=round(nse_adv/max(nse_dec,1),2)
     ad_bias_c="#00c896" if ad_ratio_now>=1.0 else "#ff4d4d"
@@ -1241,7 +1439,7 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
 <div class="con">
 <div class="mt">
   <button class="mtb active" onclick="showMain('trading',this)">&#127939; Trading Bots</button>
-  <button class="mtb" onclick="showMain('signals',this)">&#128200; Strategies <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{nb_1350+nb_gap}B {ns_1350+ns_gap}S</span></button>
+  <button class="mtb" onclick="showMain('signals',this)">&#128200; Strategies <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{nb_1350+nb_gap+nb_st}B {ns_1350+ns_gap+ns_st}S</span></button>
   <button class="mtb" onclick="showMain('nse',this)">&#128200; NSE Market</button>
   <button class="mtb" onclick="showMain('pro',this)">&#127919; Pro Engine <span style="background:#9333ea;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{npb}B {nps}S</span></button>
 </div>
@@ -1329,6 +1527,9 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
     <button class="tb" onclick="showStratTab('sgap',this)">&#128208; Gap D/U
       <span style="background:#1d4ed8;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">{nb_gap}B {ns_gap}S</span>
     </button>
+    <button class="tb" onclick="showStratTab('sst',this)">&#128312; ST+ADX
+      <span style="background:#b45309;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">{nb_st}B {ns_st}S</span>
+    </button>
   </div>
   <div id="s1350" class="tp active">
     <div class="scanbar">
@@ -1354,6 +1555,29 @@ tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
     <div class="tw"><table>
       <thead><tr><th>Signal</th><th>Symbol</th><th>Gap%</th><th>Entry &#8377;</th><th>SL &#8377;</th><th>TP &#8377;</th><th>ATR</th><th>Reason</th></tr></thead>
       <tbody>{rows_gap}</tbody>
+    </table></div>
+  </div>
+
+  <!-- SUPERTREND+ADX TAB -->
+  <div id="sst" class="tp">
+    <div class="scanbar" style="background:#1a1000;border-color:#b45309;">
+      <button class="scanbtn" style="background:#b45309;" onclick="doScanST(this)">&#9654; Scan ST+ADX</button>
+      <span style="font-size:13px;">Last: <b>{_st_scan_time}</b></span>
+      <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{nb_st}</b></span>
+      <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{ns_st}</b></span>
+    </div>
+    <div class="ib" style="background:#1a1000;border-color:#b45309;">
+      Strategy:<span>Supertrend Flip</span>
+      Filter:<span>ADX &#8805; {ST_ADX_MIN}</span>
+      Period:<span>{ST_PERIOD}</span>
+      Mult:<span>{ST_MULTIPLIER}</span>
+      SL:<span>ATR&#215;{ST_ATR_SL}</span>
+      TP:<span>ATR&#215;{ST_ATR_TP}</span>
+      TF:<span style="color:#f0b429;font-weight:700;">1-min &#128312;</span>
+    </div>
+    <div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Symbol</th><th>Entry &#8377;</th><th>SL &#8377;</th><th>TP &#8377;</th><th>ATR</th><th>ADX</th><th>Reason</th></tr></thead>
+      <tbody>{rows_st}</tbody>
     </table></div>
   </div>
 </div>
@@ -1489,6 +1713,10 @@ function doScan1350(btn){{
 function doScanGap(btn){{
   btn.textContent='⏳ Scanning...'; btn.disabled=true;
   fetch('/scan-gap').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
+}}
+function doScanST(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/scan-supertrend').then(function(){{setTimeout(function(){{location.reload();}},15000);}});
 }}
 function showStratTab(id,btn){{
   document.querySelectorAll('#main-signals .tp').forEach(function(p){{p.classList.remove('active');}});
