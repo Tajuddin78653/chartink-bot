@@ -1,1017 +1,2143 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, time as dtime
-import pytz, os, time, threading, requests, csv, json
+import pytz, os, time, threading, requests, csv
 
 app = Flask(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 os.makedirs("logs", exist_ok=True)
 
+# ── Bot 1 — tazbul ────────────────────────────
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
 CHAT_ID           = os.environ.get("CHAT_ID", "")
 CAPITAL_PER_TRADE = 10000
-SL_PERCENT        = 1.0          # kept for legacy; ATR trailing SL is used instead
-TP_PERCENT        = 0.05         # first TP target (0.05%), then trailing TP at same step
-ATR_PERIOD        = 21           # ATR period for trailing SL
-ATR_MULT          = 3            # multiplier (points mode: SL = price - ATR*mult)
-PAPER_TRADING     = os.environ.get("PAPER_TRADING", "true").lower() == "true"
-PORT              = int(os.environ.get("PORT", 10000))
-BROKER            = os.environ.get("BROKER", "dhan")   # "dhan" (more brokers later)
-MARKET_OPEN       = dtime(9,  15)
-MARKET_CLOSE      = dtime(15, 30)
-FORCE_EXIT        = dtime(15, 12)
+SL_PERCENT        = 1.0
+TP_PERCENT        = 0.05         # first TP 0.05%, then trailing TP at same step
+ATR_PERIOD        = 21           # ATR trailing SL period
+ATR_MULT          = 3            # ATR multiplier (points mode)
+BROKER            = os.environ.get("BROKER", "dhan")
+
+# ── Bot 2 — TazAmol-Test1 ─────────────────────
+BOT2_TOKEN        = os.environ.get("BOT2_TOKEN", "")
+BOT2_CHAT_ID      = os.environ.get("BOT2_CHAT_ID", "")
+BOT2_SL           = 1.0
+BOT2_TP           = 1.0
+BOT2_CAPITAL      = 10000
+
+# ── Shared ────────────────────────────────────
+PAPER_TRADING  = os.environ.get("PAPER_TRADING", "true").lower() == "true"
+PORT           = int(os.environ.get("PORT", 10000))
+MARKET_OPEN    = dtime(9,  15)
+MARKET_CLOSE   = dtime(15, 30)
+FORCE_EXIT     = dtime(15, 12)
+ATR_SL_MULT    = 1.5
+ATR_TP_MULT    = 2.0
+ADX_TREND_MIN  = 20
+
+# ── State ─────────────────────────────────────
+open_trades   = {}; closed_today  = []; traded_today  = set()
+open_trades2  = {}; closed_today2 = []; traded_today2 = set()
+
+# ── NSE cache ─────────────────────────────────
+_nse_cache = {}; _nse_cache_time = 0; NSE_CACHE_TTL = 120
+
+# ── Signal Engine ─────────────────────────────
+_last_signals = []; _last_scan_time = "Never"
+
+# ── 13/50 Strategy ────────────────────────────
+_1350_signals = []; _1350_scan_time = "Never"
+_1350_open    = {}; _1350_closed   = []
+
+# ── Gap D/U Strategy ──────────────────────────
+_gap_signals = []; _gap_scan_time = "Never"
+_gap_open    = {}; _gap_closed    = []
+
+# 🕯️ Supertrend+ADX Strategy ════════════════════════════════
+_st_signals       = []
+_st_scan_time     = "Never"
+_st_open          = {}; _st_closed = []
+ST_PERIOD         = 7        # Supertrend period (optimised for 1-min)
+ST_MULTIPLIER     = 3.0      # Supertrend multiplier
+ST_ADX_MIN        = 25       # ADX threshold — filters ranging markets
+ST_ATR_SL         = 1.5      # SL = entry ± ATR × this
+ST_ATR_TP         = 2.5      # TP = entry ± ATR × this
+
+# ── Pro Engine ────────────────────────────────
+_pro_signals       = []
+_pro_scan_time     = "Never"
+_pro_nifty_dir     = "FLAT"
+PRO_ADX_MIN        = 25
+PRO_RSI_BUY_LO     = 55;  PRO_RSI_BUY_HI  = 75
+PRO_RSI_SELL_LO    = 25;  PRO_RSI_SELL_HI = 45
+PRO_VOL_MULT       = 1.5
+PRO_BODY_MIN       = 0.50
+PRO_SHADOW_MAX     = 0.40
+PRO_ATR_SL         = 1.5
+PRO_ATR_TP1        = 2.0
+PRO_ATR_TP2        = 3.5
+PRO_MIN_RR         = 1.5
+PRO_TRADE_START    = dtime(9, 30)
+PRO_TRADE_END      = dtime(14, 30)
+
+# ── Nifty 50 ──────────────────────────────────
+NIFTY50 = [
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK",
+    "INFOSYS","SBIN","HINDUNILVR","ITC","KOTAKBANK",
+    "LT","HCLTECH","AXISBANK","BAJFINANCE","ASIANPAINT",
+    "MARUTI","SUNPHARMA","TITAN","ULTRACEMCO","ONGC",
+    "NTPC","POWERGRID","WIPRO","TECHM","NESTLEIND",
+    "BAJAJFINSV","ADANIENT","ADANIPORTS","JSWSTEEL","TATASTEEL",
+    "HINDALCO","COALINDIA","BPCL","DRREDDY","CIPLA",
+    "DIVISLAB","APOLLOHOSP","EICHERMOT","BAJAJ-AUTO","HEROMOTOCO",
+    "M&M","TATAMOTORS","TATACONSUM","BRITANNIA","GRASIM",
+    "INDUSINDBK","SBILIFE","HDFCLIFE","LTIM","UPL"
+]
+SECTORS_YAHOO = {
+    "NIFTY BANK":"^NSEBANK","NIFTY IT":"^CNXIT",
+    "NIFTY AUTO":"^CNXAUTO","NIFTY PHARMA":"^CNXPHARMA",
+    "NIFTY FMCG":"^CNXFMCG","NIFTY METAL":"^CNXMETAL",
+    "NIFTY ENERGY":"^CNXENERGY","NIFTY REALTY":"^CNXREALTY",
+}
 
 # ─────────────────────────────────────────────
-#  STATE STORE — Redis with in-memory fallback
-#  Behaviour is 100% identical when Redis is
-#  absent; existing paper/live flow is unchanged.
+#  BROKER CHARGES — Dhan Equity Intraday (MIS)
 # ─────────────────────────────────────────────
-class StateStore:
-    """
-    Thin wrapper around Redis for the three state buckets.
-    Falls back silently to plain dicts/sets when Redis is
-    not configured or unreachable — zero impact on trading.
-    """
-    _OPEN_KEY   = "chartink:open_trades"
-    _CLOSED_KEY = "chartink:closed_today"
-    _TRADED_KEY = "chartink:traded_today"
-
-    def __init__(self):
-        self._redis  = None
-        self._mem_open   = {}
-        self._mem_closed = []
-        self._mem_traded = set()
-        redis_url = os.environ.get("REDIS_URL", "")
-        if redis_url:
-            try:
-                import redis as _redis
-                client = _redis.from_url(redis_url, decode_responses=True, socket_timeout=3)
-                client.ping()          # fail fast if unreachable
-                self._redis = client
-                print("✅ Redis connected — state will persist across restarts")
-            except Exception as e:
-                print(f"⚠️  Redis unavailable ({e}) — using in-memory state")
-
-    # ── open_trades (dict) ───────────────────
-    def get_open_trades(self):
-        if self._redis:
-            raw = self._redis.get(self._OPEN_KEY)
-            return json.loads(raw) if raw else {}
-        return self._mem_open
-
-    def set_open_trades(self, data: dict):
-        if self._redis:
-            self._redis.set(self._OPEN_KEY, json.dumps(data))
-        else:
-            self._mem_open = data
-
-    # ── closed_today (list) ──────────────────
-    def get_closed_today(self):
-        if self._redis:
-            raw = self._redis.get(self._CLOSED_KEY)
-            return json.loads(raw) if raw else []
-        return self._mem_closed
-
-    def set_closed_today(self, data: list):
-        if self._redis:
-            self._redis.set(self._CLOSED_KEY, json.dumps(data))
-        else:
-            self._mem_closed = data
-
-    # ── traded_today (set) ───────────────────
-    def get_traded_today(self):
-        if self._redis:
-            return set(self._redis.smembers(self._TRADED_KEY))
-        return self._mem_traded
-
-    def add_traded_today(self, symbol: str):
-        if self._redis:
-            self._redis.sadd(self._TRADED_KEY, symbol)
-        else:
-            self._mem_traded.add(symbol)
-
-    def clear_traded_today(self):
-        if self._redis:
-            self._redis.delete(self._TRADED_KEY)
-        else:
-            self._mem_traded.clear()
-
-    def clear_day(self):
-        """Reset all daily counters — called at EOD."""
-        self.set_closed_today([])
-        self.clear_traded_today()
-
-
-_state = StateStore()
-
-def send(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url,
-            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10)
-        print("✅ Telegram sent!" if r.status_code == 200 else f"❌ {r.text}")
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
-
-def now_ist():
-    return datetime.now(IST).time()
-
-def is_market_hours():
-    return MARKET_OPEN <= now_ist() <= MARKET_CLOSE
-
-def time_str():
-    return datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p")
-
-def get_price_nse(symbol):
-    try:
-        session = requests.Session()
-        headers = {
-            "User-Agent"     : "Mozilla/5.0",
-            "Accept"         : "*/*",
-            "Referer"        : "https://www.nseindia.com",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        r = session.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
-            headers=headers, timeout=10)
-        return round(float(r.json()["priceInfo"]["lastPrice"]), 2)
-    except:
-        return None
-
-def get_price_yahoo(symbol):
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        return round(float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]), 2)
-    except:
-        return None
-
-def get_price(symbol, chartink_price=None):
-    if chartink_price:
-        try:
-            p = round(float(chartink_price), 2)
-            if p > 0:
-                print(f"✅ Chartink price {symbol}: ₹{p}")
-                return p
-        except:
-            pass
-    price = get_price_nse(symbol)
-    if price:
-        print(f"✅ NSE price {symbol}: ₹{price}")
-        return price
-    price = get_price_yahoo(symbol)
-    if price:
-        print(f"✅ Yahoo price {symbol}: ₹{price}")
-        return price
-    print(f"❌ Price failed: {symbol}")
-    return None
+def calc_charges(entry_price, exit_price, qty):
+    """Total Dhan intraday round-trip charges."""
+    buy_tv  = entry_price * qty
+    sell_tv = exit_price  * qty
+    total_tv = buy_tv + sell_tv
+    brokerage = round(min(20.0, buy_tv*0.0003) + min(20.0, sell_tv*0.0003), 2)
+    stt  = round(sell_tv  * 0.00025,  2)
+    exc  = round(total_tv * 0.0000345, 2)
+    sebi = round(total_tv * 0.000001,  2)
+    gst  = round((brokerage + exc + sebi) * 0.18, 2)
+    return round(brokerage + stt + exc + sebi + gst, 2)
 
 # ─────────────────────────────────────────────
-#  ATR TRAILING STOP — 1-min candles via Yahoo
-#  period=21, multiplier=3, points mode (no %)
-#  atr_sl = highest_high_since_entry - ATR*mult
-#  (for long trades; ratchets up, never down)
+#  ATR TRAILING SL — 1-min Yahoo candles
 # ─────────────────────────────────────────────
 def fetch_candles(symbol, period="1d", interval="1m"):
-    """Fetch OHLC candles from Yahoo Finance. Returns list of dicts."""
     try:
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS"
                f"?interval={interval}&range={period}")
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
         data = r.json()["chart"]["result"][0]
-        ts     = data["timestamp"]
         opens  = data["indicators"]["quote"][0]["open"]
         highs  = data["indicators"]["quote"][0]["high"]
         lows   = data["indicators"]["quote"][0]["low"]
         closes = data["indicators"]["quote"][0]["close"]
-        candles = []
-        for i in range(len(ts)):
-            if None in (opens[i], highs[i], lows[i], closes[i]):
-                continue
-            candles.append({"o": opens[i], "h": highs[i], "l": lows[i], "c": closes[i]})
-        return candles
+        return [{"h":highs[i],"l":lows[i],"c":closes[i]}
+                for i in range(len(closes))
+                if None not in (opens[i],highs[i],lows[i],closes[i])]
     except Exception as e:
-        print(f"⚠️ Candle fetch failed {symbol}: {e}")
-        return []
+        print(f"⚠️ Candles {symbol}: {e}"); return []
 
 def calc_atr(candles, period=ATR_PERIOD):
-    """Compute ATR using simple average of True Range over last `period` bars."""
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if len(trs) < period:
-        return None
-    return round(sum(trs[-period:]) / period, 4)
+    if len(candles) < period + 1: return None
+    trs = [max(candles[i]["h"]-candles[i]["l"],
+               abs(candles[i]["h"]-candles[i-1]["c"]),
+               abs(candles[i]["l"]-candles[i-1]["c"]))
+           for i in range(1, len(candles))]
+    return round(sum(trs[-period:]) / period, 4) if len(trs) >= period else None
 
-def calc_atr_sl(candles, mult=ATR_MULT, current_atr_sl=None):
-    """
-    ATR trailing stop (points mode, long side).
-    new_sl = latest_close - ATR * mult
-    Never moves down — ratchets up only.
-    Returns (new_sl, atr_value).
-    """
+def calc_atr_sl(candles, current_atr_sl=None):
     atr = calc_atr(candles)
-    if atr is None or not candles:
-        return current_atr_sl, None
-    latest_close = candles[-1]["c"]
-    raw_sl = round(latest_close - atr * mult, 2)
-    # ratchet: never let SL move down
+    if atr is None or not candles: return current_atr_sl, None
+    raw_sl = round(candles[-1]["c"] - atr * ATR_MULT, 2)
     if current_atr_sl is not None:
         raw_sl = max(raw_sl, current_atr_sl)
     return raw_sl, atr
 
 # ─────────────────────────────────────────────
-#  BROKER CHARGES — Dhan Equity Intraday (MIS)
-#  Both entry + exit orders are counted.
-#  Dhan: ₹20 per order OR 0.03% of turnover,
-#        whichever is LOWER — applied twice.
-#  Plus STT (0.025% on sell side), exchange txn
-#  charge (0.00345%), SEBI (₹10/crore), GST 18%.
+#  HELPERS
 # ─────────────────────────────────────────────
-def calc_charges(entry_price, exit_price, qty):
-    """Return total Dhan intraday charges for one round-trip trade."""
-    buy_turnover  = entry_price * qty
-    sell_turnover = exit_price  * qty
-    total_turnover = buy_turnover + sell_turnover
+def send(msg, token=None, chat_id=None):
+    t = token or BOT_TOKEN; c = chat_id or CHAT_ID
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
+            data={"chat_id":c,"text":msg,"parse_mode":"HTML"}, timeout=10)
+        print("✅ TG sent!" if r.status_code==200 else f"❌ {r.text}")
+    except Exception as e: print(f"❌ TG: {e}")
 
-    # Brokerage: min(₹20, 0.03% of turnover) per order — 2 orders (buy + sell)
-    brok_entry = min(20.0, buy_turnover  * 0.0003)
-    brok_exit  = min(20.0, sell_turnover * 0.0003)
-    brokerage  = round(brok_entry + brok_exit, 2)
+def now_ist(): return datetime.now(IST).time()
+def is_market_hours(): return MARKET_OPEN <= now_ist() <= MARKET_CLOSE
+def time_str(): return datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p")
 
-    # STT: 0.025% on sell-side turnover (intraday)
-    stt = round(sell_turnover * 0.00025, 2)
+def get_price_yahoo(symbol):
+    try:
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS",
+            headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        return round(float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]),2)
+    except: return None
 
-    # Exchange transaction charge: 0.00345% of total turnover (NSE)
-    exc = round(total_turnover * 0.0000345, 2)
+def get_price_nse(symbol):
+    try:
+        s = requests.Session()
+        h = {"User-Agent":"Mozilla/5.0","Accept":"*/*",
+             "Referer":"https://www.nseindia.com","Accept-Language":"en-US,en;q=0.9"}
+        s.get("https://www.nseindia.com", headers=h, timeout=10)
+        r = s.get(f"https://www.nseindia.com/api/quote-equity?symbol={symbol}", headers=h, timeout=10)
+        return round(float(r.json()["priceInfo"]["lastPrice"]),2)
+    except: return None
 
-    # SEBI charges: ₹10 per crore of total turnover
-    sebi = round(total_turnover * 0.000001, 2)
+def get_price(symbol, chartink_price=None):
+    if chartink_price:
+        try:
+            p = round(float(chartink_price),2)
+            if p > 0: return p
+        except: pass
+    return get_price_nse(symbol) or get_price_yahoo(symbol)
 
-    # Subtotal before GST
-    sub = brokerage + stt + exc + sebi
+def calculate_trade(symbol, price, sl_pct, tp_pct, capital):
+    # For bot1 (tazbul) use ATR trailing SL; for other bots keep fixed %
+    candles = fetch_candles(symbol)
+    atr_sl, atr_val = calc_atr_sl(candles)
+    sl  = atr_sl if (atr_sl and sl_pct == SL_PERCENT) else round(price*(1-sl_pct/100),2)
+    tp  = round(price*(1+tp_pct/100),2)
+    qty = max(1,int(capital/price))
+    return {"symbol":symbol,"entry":price,"qty":qty,"sl":sl,"tp":tp,
+            "atr_val":atr_val,"trail_tp":None,"tp_hit":False,
+            "capital_used":round(qty*price,2),
+            "risk_amt":round((price-sl)*qty,2),
+            "reward_amt":round((tp-price)*qty,2),
+            "entry_time":time_str(),"exit_time":None}
 
-    # GST: 18% on (brokerage + exc + sebi)  — NOT on STT
-    gst = round((brokerage + exc + sebi) * 0.18, 2)
-
-    total = round(sub + gst, 2)
-    return total
-
-def calculate(symbol, price):
-    # Initial ATR SL: fetch candles at entry; fallback to fixed 1% if ATR unavailable
-    candles  = fetch_candles(symbol)
-    atr_sl, atr_val = calc_atr_sl(candles, current_atr_sl=None)
-    sl_price = atr_sl if atr_sl else round(price * (1 - SL_PERCENT / 100), 2)
-    tp_price = round(price * (1 + TP_PERCENT / 100), 2)   # first TP at 0.05%
-    sl_dist  = round(price - sl_price, 2)
-    qty      = max(1, int(CAPITAL_PER_TRADE / price))
-    risk_amt = round(sl_dist * qty, 2)
-    reward_amt = round((tp_price - price) * qty, 2)
-    return {
-        "symbol"      : symbol,
-        "entry"       : price,
-        "qty"         : qty,
-        "sl"          : sl_price,            # ATR trailing SL (updates every monitor tick)
-        "tp"          : tp_price,            # first TP level (0.05%)
-        "atr_val"     : atr_val,             # last computed ATR value
-        "trail_tp"    : None,                # None = first TP not yet hit; float = trailing TP active
-        "tp_hit"      : False,               # flag: has first TP been reached?
-        "capital_used": round(qty * price, 2),
-        "risk_amt"    : risk_amt,
-        "reward_amt"  : reward_amt,
-        "entry_time"  : time_str(),
-        "exit_time"   : None,
-        "paper"       : PAPER_TRADING,
-    }
-
-def open_trade(symbol, price):
-    open_trades  = _state.get_open_trades()
-    traded_today = _state.get_traded_today()
-    if symbol in open_trades or symbol in traded_today:
-        print(f"⚠️ Skip {symbol} — already open or traded today")
-        return
-    trade = calculate(symbol, price)
-    open_trades[symbol] = trade
-    _state.set_open_trades(open_trades)
-    _state.add_traded_today(symbol)
-    mode    = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
-    atr_tag = f"₹{trade['atr_val']}" if trade.get('atr_val') else "calculating…"
-    send(
-        f"📝 <b>{mode} TRADE ENTRY</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 Stock      : <b>{symbol}</b>\n"
-        f"💰 Entry      : ₹{price}\n"
-        f"📦 Quantity   : {trade['qty']} shares\n"
-        f"🔴 ATR SL     : ₹{trade['sl']} (ATR×{ATR_MULT}={atr_tag})\n"
-        f"🟢 First TP   : ₹{trade['tp']} ({TP_PERCENT}%)\n"
-        f"📈 Trail TP   : 0.05% step once TP hit\n"
-        f"💵 Capital    : ₹{trade['capital_used']}\n"
-        f"⚠️ Risk       : ₹{trade['risk_amt']}\n"
-        f"🎯 Reward     : ₹{trade['reward_amt']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {trade['entry_time']}"
-    )
-    print(f"📝 Opened: {symbol} @ ₹{price}")
-
-def close_trade(symbol, exit_price, reason):
-    open_trades = _state.get_open_trades()
-    if symbol not in open_trades:
-        return
-    trade = open_trades.pop(symbol)
-    _state.set_open_trades(open_trades)
-    trade["exit_time"] = time_str()
-    gross_pnl = round((exit_price - trade["entry"]) * trade["qty"], 2)
-    charges   = calc_charges(trade["entry"], exit_price, trade["qty"])
-    net_pnl   = round(gross_pnl - charges, 2)
-    result    = "PROFIT" if net_pnl >= 0 else "LOSS"
-    mode      = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
-    send(
-        f"{'✅' if net_pnl >= 0 else '❌'} <b>{mode} EXIT — {result}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 Stock    : <b>{symbol}</b>\n"
-        f"💰 Entry    : ₹{trade['entry']}\n"
-        f"🚪 Exit     : ₹{exit_price}\n"
-        f"📦 Qty      : {trade['qty']} shares\n"
-        f"💹 Gross P&L: {'+'if gross_pnl>=0 else ''}₹{gross_pnl}\n"
-        f"🏦 Charges  : -₹{charges} (Dhan)\n"
-        f"{'💚' if net_pnl >= 0 else '❤️'} Net P&L  : {'+'if net_pnl>=0 else ''}₹{net_pnl}\n"
-        f"📝 Reason   : {reason}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {trade['exit_time']}"
-    )
-    closed_today = _state.get_closed_today()
-    closed_today.append({"symbol": symbol, "pnl": net_pnl, "charges": charges, "gross_pnl": gross_pnl})
-    _state.set_closed_today(closed_today)
-    log_trade(trade, exit_price, gross_pnl, charges, net_pnl, reason)
-
-def log_trade(trade, exit_price, gross_pnl, charges, net_pnl, reason):
-    f      = "logs/trades.csv"
-    exists = os.path.exists(f)
-    with open(f, "a", newline="") as fp:
+def log_trade(trade, exit_price, gross_pnl, charges, net_pnl, reason, logfile):
+    exists = os.path.exists(logfile)
+    with open(logfile,"a",newline="") as fp:
         w = csv.writer(fp)
         if not exists:
-            w.writerow(["date","symbol","entry","exit","qty",
-                        "sl","tp","risk","reward","gross_pnl",
-                        "charges","net_pnl",
+            w.writerow(["date","symbol","entry","exit","qty","sl","tp",
+                        "risk","reward","gross_pnl","charges","net_pnl",
                         "result","reason","entry_time","exit_time"])
-        w.writerow([
-            datetime.now(IST).strftime("%Y-%m-%d"),
-            trade["symbol"], trade["entry"], exit_price,
-            trade["qty"], trade["sl"], trade["tp"],
-            trade["risk_amt"], trade["reward_amt"],
-            gross_pnl, charges, net_pnl,
-            "WIN" if net_pnl >= 0 else "LOSS",
-            reason, trade["entry_time"], trade["exit_time"]
-        ])
-
-def check_positions():
-    open_trades = _state.get_open_trades()
-    for symbol in list(open_trades.keys()):
-        trade = open_trades.get(symbol)
-        if not trade:
-            continue
-        price = get_price(symbol)
-        if not price:
-            continue
-
-        changed = False
-
-        # ── 1. Update ATR trailing SL every tick ──────────────────
-        candles = fetch_candles(symbol)
-        new_atr_sl, new_atr_val = calc_atr_sl(candles, current_atr_sl=trade["sl"])
-        if new_atr_sl and new_atr_sl != trade["sl"]:
-            print(f"📐 {symbol} ATR SL: ₹{trade['sl']} → ₹{new_atr_sl}  (ATR={new_atr_val})")
-            trade["sl"]      = new_atr_sl
-            trade["atr_val"] = new_atr_val
-            changed = True
-
-        # ── 2. Trailing TP logic ───────────────────────────────────
-        if not trade.get("tp_hit"):
-            # Phase 1: waiting for first TP hit (price >= entry * 1.0005)
-            if price >= trade["tp"]:
-                trade["tp_hit"]   = True
-                trade["trail_tp"] = round(price * (1 + TP_PERCENT / 100), 2)
-                changed = True
-                send(
-                    f"🎯 <b>First TP Hit — Trailing TP Activated</b>\n"
-                    f"📌 {symbol} @ ₹{price}\n"
-                    f"📈 Trailing TP locked at: ₹{trade['trail_tp']}\n"
-                    f"🔴 ATR SL: ₹{trade['sl']}"
-                )
-                print(f"🎯 {symbol} first TP @ ₹{price}, trail_tp=₹{trade['trail_tp']}")
-        else:
-            # Phase 2: trailing TP active
-            # Ratchet trail_tp up as price rises (new level = price * 1.0005)
-            new_trail = round(price * (1 + TP_PERCENT / 100), 2)
-            if new_trail > trade["trail_tp"]:
-                print(f"📈 {symbol} trail_tp ratchet: ₹{trade['trail_tp']} → ₹{new_trail}")
-                trade["trail_tp"] = new_trail
-                changed = True
-            # Exit when price retraces below (trail_tp - one 0.05% step)
-            # i.e. price has pulled back one full TP step from the locked trail
-            exit_trigger = round(trade["trail_tp"] / (1 + TP_PERCENT / 100), 2)
-            if price <= exit_trigger:
-                # save state before close_trade pops the trade
-                if changed:
-                    cur = _state.get_open_trades()
-                    if symbol in cur:
-                        cur[symbol] = trade
-                        _state.set_open_trades(cur)
-                close_trade(symbol, price, "📈 Trailing TP Exit")
-                continue
-
-        # ── 3. ATR SL exit ────────────────────────────────────────
-        print(f"📊 {symbol}: ₹{price} | ATR SL:₹{trade['sl']} | "
-              f"trail_tp:{trade.get('trail_tp') or '—'} | tp_hit:{trade.get('tp_hit')}")
-        if price <= trade["sl"]:
-            if changed:
-                cur = _state.get_open_trades()
-                if symbol in cur:
-                    cur[symbol] = trade
-                    _state.set_open_trades(cur)
-            reason = "🔴 ATR Trailing SL Hit" if not trade.get("tp_hit") else "🔴 ATR SL Hit (after TP)"
-            close_trade(symbol, price, reason)
-            continue
-
-        # ── 4. Persist updated trade state ────────────────────────
-        if changed:
-            cur = _state.get_open_trades()
-            if symbol in cur:
-                cur[symbol] = trade
-                _state.set_open_trades(cur)
-
-def send_eod():
-    closed_today = _state.get_closed_today()
-    winners      = [t for t in closed_today if t["pnl"] >= 0]
-    losers       = [t for t in closed_today if t["pnl"] <  0]
-    gross        = round(sum(t.get("gross_pnl", t["pnl"]) for t in closed_today), 2)
-    total_chg    = round(sum(t.get("charges", 0) for t in closed_today), 2)
-    net          = round(sum(t["pnl"] for t in closed_today), 2)
-    icon         = "💚" if net >= 0 else "❤️"
-    gross_win    = round(sum(t.get("gross_pnl", t["pnl"]) for t in winners), 2)
-    gross_loss   = round(abs(sum(t.get("gross_pnl", t["pnl"]) for t in losers)), 2)
-    send(
-        f"📋 <b>DAILY P&L SUMMARY</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 Date         : {datetime.now(IST).strftime('%d %b %Y')}\n"
-        f"📊 Total Trades : {len(closed_today)}\n"
-        f"✅ Winners      : {len(winners)}\n"
-        f"❌ Losers       : {len(losers)}\n"
-        f"💚 Gross Profit : ₹{gross_win:.2f}\n"
-        f"❤️ Gross Loss   : ₹{gross_loss:.2f}\n"
-        f"💹 Gross P&L    : {'+'if gross>=0 else ''}₹{gross:.2f}\n"
-        f"🏦 Total Charges: -₹{total_chg:.2f} (Dhan)\n"
-        f"{icon} Net P&L     : {'+'if net>=0 else ''}₹{net:.2f}\n"
-        f"📈 Stocks       : {', '.join(t['symbol'] for t in closed_today)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧪 {'Paper Trading' if PAPER_TRADING else 'Live Trading'}"
-    )
-    _state.clear_day()
-    print("📋 EOD done — counters reset")
-
-def run_monitor():
-    eod_sent = False
-    print("📈 Monitor started — every 1 min")
-    while True:
-        try:
-            t = now_ist()
-            open_trades = _state.get_open_trades()
-            if t >= FORCE_EXIT and open_trades:
-                send("⏰ <b>3:12 PM — Force closing all MIS positions!</b>")
-                for sym in list(open_trades.keys()):
-                    p = get_price(sym) or open_trades[sym]["entry"]
-                    close_trade(sym, p, "⏰ Force Exit 3:12 PM")
-            if t >= MARKET_CLOSE and not eod_sent:
-                send_eod()
-                eod_sent = True
-            if t < dtime(9, 0):
-                eod_sent = False
-            if is_market_hours() and _state.get_open_trades():
-                check_positions()
-        except Exception as e:
-            print(f"❌ Monitor error: {e}")
-        time.sleep(60)
-
-@app.route("/alert", methods=["POST"])
-def receive_alert():
-    data    = request.json or request.form.to_dict()
-    raw_stk = data.get("stocks", "")
-    raw_prc = data.get("trigger_prices", "")
-    stocks  = [s.strip().upper() for s in raw_stk.split(",") if s.strip()]
-    prices  = [p.strip() for p in raw_prc.split(",") if p.strip()]
-    if not stocks:
-        return jsonify({"status": "no stocks"}), 400
-    print(f"📊 Alert: {stocks}")
-    open_trades  = _state.get_open_trades()
-    traded_today = _state.get_traded_today()
-    results = []
-    for i, symbol in enumerate(stocks):
-        if symbol in traded_today:
-            results.append({"symbol": symbol, "status": "already traded"})
-            continue
-        if symbol in open_trades:
-            results.append({"symbol": symbol, "status": "already open"})
-            continue
-        chartink_price = prices[i] if i < len(prices) else None
-        price          = get_price(symbol, chartink_price)
-        if not price:
-            send(f"❌ <b>Price fetch failed: {symbol}</b>")
-            results.append({"symbol": symbol, "status": "price failed"})
-            continue
-        open_trade(symbol, price)
-        results.append({"symbol": symbol, "status": "entered", "price": price})
-    return jsonify({"status": "processed", "results": results}), 200
-
-@app.route("/", methods=["GET"])
-def home():
-    open_trades  = _state.get_open_trades()
-    traded_today = _state.get_traded_today()
-    closed_today = _state.get_closed_today()
-    return jsonify({
-        "status"           : "🟢 Running",
-        "mode"             : "🧪 Paper" if PAPER_TRADING else "⚡ Live",
-        "time_ist"         : time_str(),
-        "market_open"      : is_market_hours(),
-        "open_positions"   : list(open_trades.keys()),
-        "total_open"       : len(open_trades),
-        "traded_today"     : list(traded_today),
-        "closed_today"     : len(closed_today),
-        "capital_per_trade": CAPITAL_PER_TRADE,
-        "sl_percent"       : SL_PERCENT,
-        "tp_percent"       : TP_PERCENT,
-        "force_exit"       : "3:12 PM",
-        "eod_report"       : "3:30 PM",
-    }), 200
-
-@app.route("/test", methods=["GET"])
-def test():
-    send(
-        f"✅ <b>Bot is Working!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧪 Mode          : {'Paper' if PAPER_TRADING else 'Live'}\n"
-        f"📡 Signal        : Chartink tazbul\n"
-        f"💰 Capital/Trade : ₹{CAPITAL_PER_TRADE}\n"
-        f"🔴 Stop Loss     : {SL_PERCENT}%\n"
-        f"🟢 Take Profit   : {TP_PERCENT}%\n"
-        f"🔁 Repeat Trade  : ❌ No\n"
-        f"📊 Max Positions : Unlimited\n"
-        f"🚪 Force Exit    : 3:12 PM\n"
-        f"📋 EOD Report    : 3:30 PM\n"
-        f"🕐 Time IST      : {time_str()}"
-    )
-    return jsonify({"status": "test sent"}), 200
-
-@app.route("/status", methods=["GET"])
-def status():
-    open_trades  = _state.get_open_trades()
-    traded_today = _state.get_traded_today()
-    closed_today = _state.get_closed_today()
-    return jsonify({
-        "open_trades" : list(open_trades.keys()),
-        "traded_today": list(traded_today),
-        "closed_today": [{"symbol": t["symbol"], "pnl": t["pnl"]}
-                         for t in closed_today],
-        "net_pnl"     : round(sum(t["pnl"] for t in closed_today), 2),
-    }), 200
-
-@app.route("/report", methods=["GET"])
-def report():
-    send_eod()
-    return jsonify({"status": "report sent"}), 200
+        w.writerow([datetime.now(IST).strftime("%Y-%m-%d"),
+            trade["symbol"],trade["entry"],exit_price,trade["qty"],
+            trade["sl"],trade["tp"],trade["risk_amt"],trade["reward_amt"],
+            gross_pnl,charges,net_pnl,
+            "WIN" if net_pnl>=0 else "LOSS",reason,trade["entry_time"],trade["exit_time"]])
 
 # ─────────────────────────────────────────────
-#  LIVE PRICES — used by dashboard JS
+#  LIVE PRICES API
 # ─────────────────────────────────────────────
 @app.route("/prices", methods=["GET"])
-def prices():
-    """Return current market price for every open position."""
-    open_trades = _state.get_open_trades()
+def prices_api():
+    """Returns live price + unrealised PnL for all open positions (both bots)."""
     result = {}
     for sym, t in open_trades.items():
         price = get_price(sym)
         if price:
             unreal = round((price - t["entry"]) * t["qty"], 2)
-            result[sym] = {"price": price, "unrealised_pnl": unreal}
+            pct    = round((price - t["entry"]) / t["entry"] * 100, 2)
+            result[sym] = {"price":price, "unrealised_pnl":unreal, "pct":pct, "bot":"1"}
+    for sym, t in open_trades2.items():
+        price = get_price(sym)
+        if price:
+            unreal = round((price - t["entry"]) * t["qty"], 2)
+            pct    = round((price - t["entry"]) / t["entry"] * 100, 2)
+            result[sym+"__2"] = {"price":price, "unrealised_pnl":unreal, "pct":pct, "bot":"2"}
     return jsonify(result), 200
 
 # ─────────────────────────────────────────────
-#  MANUAL CLOSE — dashboard close button
+#  MANUAL CLOSE API
 # ─────────────────────────────────────────────
-@app.route("/close/<symbol>", methods=["POST"])
-def manual_close(symbol):
+@app.route("/close/<bot>/<symbol>", methods=["POST"])
+def manual_close(bot, symbol):
     symbol = symbol.upper()
-    open_trades = _state.get_open_trades()
-    if symbol not in open_trades:
-        return jsonify({"status": "not found"}), 404
-    price = get_price(symbol) or open_trades[symbol]["entry"]
-    close_trade(symbol, price, "🖱️ Manual Close (Dashboard)")
-    return jsonify({"status": "closed", "symbol": symbol, "price": price}), 200
+    if bot == "1":
+        if symbol not in open_trades:
+            return jsonify({"status":"not found"}), 404
+        price = get_price(symbol) or open_trades[symbol]["entry"]
+        close_trade(symbol, price, "🖱️ Manual Close")
+        return jsonify({"status":"closed","symbol":symbol,"price":price}), 200
+    elif bot == "2":
+        if symbol not in open_trades2:
+            return jsonify({"status":"not found"}), 404
+        price = get_price(symbol) or open_trades2[symbol]["entry"]
+        close_trade2(symbol, price, "🖱️ Manual Close")
+        return jsonify({"status":"closed","symbol":symbol,"price":price}), 200
+    return jsonify({"status":"invalid bot"}), 400
+
+@app.route("/open_strat/<strat>/<symbol>", methods=["POST"])
+def open_strat(strat, symbol):
+    symbol = symbol.upper()
+    stores = {"1350": _1350_open, "gap": _gap_open, "st": _st_open}
+    if strat not in stores:
+        return jsonify({"status":"invalid strategy"}), 400
+    open_d = stores[strat]
+    if symbol in open_d:
+        return jsonify({"status":"already open"}), 409
+    data = request.get_json(force=True)
+    open_d[symbol] = {
+        "symbol": symbol, "signal": data["signal"],
+        "entry": data["entry"], "sl": data["sl"], "tp": data["tp"],
+        "qty": data["qty"], "capital_used": round(data["entry"]*data["qty"],2),
+        "entry_time": time_str()
+    }
+    return jsonify({"status":"opened","symbol":symbol}), 200
+
+
+
+@app.route("/close_strat/<strat>/<symbol>", methods=["POST"])
+def close_strat(strat, symbol):
+    symbol = symbol.upper()
+    stores = {"1350": (_1350_open, _1350_closed), "gap": (_gap_open, _gap_closed), "st": (_st_open, _st_closed)}
+    if strat not in stores:
+        return jsonify({"status":"invalid strategy"}), 400
+    open_d, closed_l = stores[strat]
+    if symbol not in open_d:
+        return jsonify({"status":"not found"}), 404
+    price = get_price(symbol) or open_d[symbol]["entry"]
+    t = open_d.pop(symbol)
+    pnl = round((price - t["entry"]) * t["qty"] if t["signal"] == "BUY" else (t["entry"] - price) * t["qty"], 2)
+    t.update({"exit": price, "pnl": pnl, "exit_time": time_str(), "date": datetime.now(IST).strftime("%Y-%m-%d")})
+    closed_l.append(t)
+    return jsonify({"status":"closed","symbol":symbol,"price":price,"pnl":pnl}), 200
+
+
+
+# ─────────────────────────────────────────────
+#  NSE MARKET DATA — Yahoo Finance
+# ─────────────────────────────────────────────
+def fetch_nse_data():
+    global _nse_cache, _nse_cache_time
+    if _nse_cache and (time.time()-_nse_cache_time) < NSE_CACHE_TTL:
+        return _nse_cache
+    result = {"preopen":[],"advances":0,"declines":0,"unchanged":0,
+              "sectors":[],"fetched_at":time_str(),"error":None,
+              "nifty_ltp":0,"nifty_chg":0}
+    try:
+        import yfinance as yf
+        try:
+            nh = yf.Ticker("^NSEI").history(period="2d",interval="1d")
+            if len(nh)>=2:
+                result["nifty_ltp"] = round(float(nh["Close"].iloc[-1]),2)
+                prev = float(nh["Close"].iloc[-2])
+                result["nifty_chg"] = round((result["nifty_ltp"]-prev)/prev*100,2)
+        except: pass
+        adv=dec=unc=0; stock_list=[]
+        for sym in NIFTY50:
+            try:
+                h = yf.Ticker(f"{sym}.NS").history(period="2d",interval="1d")
+                if len(h)<2: continue
+                ltp=round(float(h["Close"].iloc[-1]),2)
+                prev=round(float(h["Close"].iloc[-2]),2)
+                chg=round(ltp-prev,2); pchg=round((chg/prev)*100,2) if prev else 0
+                vol=int(h["Volume"].iloc[-1])
+                if pchg>0: adv+=1
+                elif pchg<0: dec+=1
+                else: unc+=1
+                stock_list.append({"symbol":sym,"ltp":ltp,"iep":ltp,"change":chg,"pchange":pchg,"volume":vol})
+            except: pass
+        stock_list.sort(key=lambda x:abs(x["pchange"]),reverse=True)
+        result["preopen"]=stock_list; result["advances"]=adv
+        result["declines"]=dec; result["unchanged"]=unc
+        sector_list=[]
+        for name,ticker in SECTORS_YAHOO.items():
+            try:
+                h=yf.Ticker(ticker).history(period="2d",interval="1d")
+                if len(h)<2: continue
+                ltp=float(h["Close"].iloc[-1]); prev=float(h["Close"].iloc[-2])
+                pchg=round((ltp-prev)/prev*100,2) if prev else 0
+                vol=int(h["Volume"].iloc[-1])
+                sector_list.append({"name":name,"pchange":pchg,"volume":vol})
+            except: pass
+        sector_list.sort(key=lambda x:x["volume"],reverse=True)
+        result["sectors"]=sector_list
+    except Exception as e: result["error"]=str(e)
+    result["fetched_at"]=time_str()
+    _nse_cache=result; _nse_cache_time=time.time()
+    return result
+
+# ─────────────────────────────────────────────
+#  SIGNAL ENGINE — 6 Rules
+# ─────────────────────────────────────────────
+def fetch_candles(symbol):
+    try:
+        import yfinance as yf
+        df = yf.Ticker(f"{symbol}.NS").history(period="5d",interval="5m")
+        if df is None or len(df)<60: return None
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+        return df[["open","high","low","close","volume"]].copy()
+    except: return None
+
+def fetch_candles_1m(symbol):
+    """Fetch 1-minute candles — used exclusively by Supertrend+ADX strategy."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(f"{symbol}.NS").history(period="5d", interval="1m")
+        if df is None or len(df) < 50: return None
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+        return df[["open","high","low","close","volume"]].copy()
+    except: return None
+
+def calc_ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+def calc_atr(df, window=14):
+    h,l,c = df["high"],df["low"],df["close"]
+    tr = (h-l).combine((h-c.shift()).abs(),max).combine((l-c.shift()).abs(),max)
+    return tr.rolling(window).mean()
+
+def calc_adx(df, window=14):
+    try:
+        h,l,c = df["high"],df["low"],df["close"]
+        up=h-h.shift(); down=l.shift()-l
+        pdm=up.where((up>down)&(up>0),0.0); ndm=down.where((down>up)&(down>0),0.0)
+        tr=(h-l).combine((h-c.shift()).abs(),max).combine((l-c.shift()).abs(),max)
+        atr=tr.rolling(window).mean()
+        pdi=100*pdm.rolling(window).mean()/atr; ndi=100*ndm.rolling(window).mean()/atr
+        dx=(100*(pdi-ndi).abs()/(pdi+ndi)).replace([float("inf"),float("nan")],0)
+        return dx.rolling(window).mean()
+    except: return None
+
+def get_nifty_direction():
+    try:
+        import yfinance as yf
+        df = yf.Ticker("^NSEI").history(period="2d",interval="5m")
+        if df is None or len(df)<14: return "FLAT"
+        closes=df["Close"]; ema13=closes.ewm(span=13,adjust=False).mean()
+        last=float(closes.iloc[-1]); e13=float(ema13.iloc[-1])
+        if last>e13*1.001: return "UP"
+        elif last<e13*0.999: return "DOWN"
+        return "FLAT"
+    except: return "FLAT"
+
+def check_signal(symbol, market_dir):
+    res={"symbol":symbol,"signal":"SKIP","reason":"","entry":0,"sl":0,"tp":0,"atr":0}
+    df=fetch_candles(symbol)
+    if df is None: res["reason"]="No candle data"; return res
+    df["ema13"]=calc_ema(df["close"],13); df["ema50"]=calc_ema(df["close"],50)
+    df["atr"]=calc_atr(df)
+    adx_s=calc_adx(df); df["adx"]=adx_s if adx_s is not None else 25.0
+    df=df.dropna(subset=["ema13","ema50","atr","adx"])
+    if len(df)<3: res["reason"]="Not enough data"; return res
+    cur=df.iloc[-1]; prev=df.iloc[-2]
+    e13c=float(cur["ema13"]); e50c=float(cur["ema50"])
+    e13p=float(prev["ema13"]); e50p=float(prev["ema50"])
+    atr=float(cur["atr"]); adx=float(cur["adx"])
+    close=float(cur["close"]); opn=float(cur["open"])
+    high=float(cur["high"]); low=float(cur["low"])
+    res["atr"]=round(atr,2); res["entry"]=round(close,2)
+    if adx<ADX_TREND_MIN: res["reason"]=f"Consolidating ADX={adx:.1f}"; return res
+    rng=high-low
+    if rng>0:
+        body=abs(close-opn)/rng; shadow=((high-max(close,opn))+(min(close,opn)-low))/rng
+        dist=abs(close-e13c)/e13c*100
+        if body<0.4: res["reason"]=f"Small body {body:.2f}"; return res
+        if shadow>0.5: res["reason"]=f"Big shadow {shadow:.2f}"; return res
+        if dist>1.0: res["reason"]=f"Far EMA13 {dist:.2f}%"; return res
+    crossed_up=(e13p<=e50p)and(e13c>e50c); crossed_down=(e13p>=e50p)and(e13c<e50c)
+    if not crossed_up and not crossed_down: res["reason"]="No EMA crossover"; return res
+    if crossed_up and market_dir=="DOWN": res["reason"]="BUY but Nifty DOWN"; return res
+    if crossed_down and market_dir=="UP": res["reason"]="SELL but Nifty UP"; return res
+    if crossed_up:
+        res["signal"]="BUY"; res["sl"]=round(close-ATR_SL_MULT*atr,2)
+        res["tp"]=round(close+ATR_TP_MULT*atr,2)
+        res["reason"]=f"EMA13>EMA50 | ADX={adx:.1f} | Nifty={market_dir}"
+    else:
+        res["signal"]="SELL"; res["sl"]=round(close+ATR_SL_MULT*atr,2)
+        res["tp"]=round(close-ATR_TP_MULT*atr,2)
+        res["reason"]=f"EMA13<EMA50 | ADX={adx:.1f} | Nifty={market_dir}"
+    return res
+
+def run_signal_scan():
+    global _last_signals, _last_scan_time
+    print(f"🔍 Scan {time_str()}")
+    market_dir=get_nifty_direction(); results=[]
+    for symbol in NIFTY50:
+        try:
+            r=check_signal(symbol,market_dir); r["market_dir"]=market_dir; results.append(r)
+            if r["signal"]=="BUY" and symbol not in traded_today2 and symbol not in open_trades2:
+                qty=max(1,int(BOT2_CAPITAL/r["entry"]))
+                trade={"symbol":symbol,"entry":r["entry"],"qty":qty,
+                       "sl":r["sl"],"tp":r["tp"],
+                       "capital_used":round(qty*r["entry"],2),
+                       "risk_amt":round(abs(r["entry"]-r["sl"])*qty,2),
+                       "reward_amt":round(abs(r["tp"]-r["entry"])*qty,2),
+                       "entry_time":time_str(),"exit_time":None}
+                open_trades2[symbol]=trade; traded_today2.add(symbol)
+                send(f"🤖 <b>SIGNAL ENGINE — BUY</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                     f"📌 Stock  : <b>{symbol}</b>\n"
+                     f"💰 Entry  : ₹{r['entry']}\n"
+                     f"🔴 SL     : ₹{r['sl']}\n"
+                     f"🟢 TP     : ₹{r['tp']}\n"
+                     f"📊 Reason : {r['reason']}\n"
+                     f"🕐 {time_str()}",
+                     token=BOT2_TOKEN, chat_id=BOT2_CHAT_ID)
+        except Exception as e:
+            results.append({"symbol":symbol,"signal":"SKIP","reason":str(e),
+                            "entry":0,"sl":0,"tp":0,"atr":0,"market_dir":market_dir})
+    _last_signals=results; _last_scan_time=time_str()
+    b=sum(1 for r in results if r["signal"]=="BUY")
+    s=sum(1 for r in results if r["signal"]=="SELL")
+    print(f"✅ Scan done BUY:{b} SELL:{s} SKIP:{len(results)-b-s}")
+
+# ─────────────────────────────────────────────
+#  13/50 STRATEGY
+#  EMA13/50 crossover + Nifty A/D market bias
+# ─────────────────────────────────────────────
+def check_1350_signal(symbol, market_dir, ad_ratio):
+    res = {"symbol":symbol,"signal":"SKIP","reason":"","entry":0,"sl":0,"tp":0,"atr":0,"ad_ratio":round(ad_ratio,2)}
+    df = fetch_candles(symbol)
+    if df is None: res["reason"]="No data"; return res
+    df["ema13"] = calc_ema(df["close"],13)
+    df["ema50"] = calc_ema(df["close"],50)
+    df["atr"]   = calc_atr(df)
+    df = df.dropna(subset=["ema13","ema50","atr"])
+    if len(df)<3: res["reason"]="Not enough data"; return res
+    cur=df.iloc[-1]; prev=df.iloc[-2]
+    e13c=float(cur["ema13"]); e50c=float(cur["ema50"])
+    e13p=float(prev["ema13"]); e50p=float(prev["ema50"])
+    atr=float(cur["atr"]); close=float(cur["close"])
+    res["atr"]=round(atr,2); res["entry"]=round(close,2)
+    crossed_up   = (e13p<=e50p) and (e13c>e50c)
+    crossed_down = (e13p>=e50p) and (e13c<e50c)
+    if not crossed_up and not crossed_down:
+        res["reason"]="No EMA crossover"; return res
+    # Market bias filter using A/D ratio
+    if crossed_up and ad_ratio < 1.0:
+        res["reason"]=f"BUY but market bearish A/D={ad_ratio:.2f}"; return res
+    if crossed_down and ad_ratio > 1.0:
+        res["reason"]=f"SELL but market bullish A/D={ad_ratio:.2f}"; return res
+    if crossed_up:
+        res["signal"]="BUY"
+        res["sl"]=round(close - ATR_SL_MULT*atr,2)
+        res["tp"]=round(close + ATR_TP_MULT*atr,2)
+        res["reason"]=f"EMA13>EMA50 | Nifty={market_dir} | A/D={ad_ratio:.2f}"
+    else:
+        res["signal"]="SELL"
+        res["sl"]=round(close + ATR_SL_MULT*atr,2)
+        res["tp"]=round(close - ATR_TP_MULT*atr,2)
+        res["reason"]=f"EMA13<EMA50 | Nifty={market_dir} | A/D={ad_ratio:.2f}"
+    return res
+
+def run_1350_scan():
+    global _1350_signals, _1350_scan_time
+    print(f"📊 13/50 scan {time_str()}")
+    market_dir = get_nifty_direction()
+    nse = fetch_nse_data()
+    adv = nse.get("advances",1); dec = nse.get("declines",1)
+    ad_ratio = round(adv / max(dec,1), 2)
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = check_1350_signal(symbol, market_dir, ad_ratio)
+            r["market_dir"] = market_dir
+            results.append(r)
+            # Telegram alert on signal
+            if r["signal"] in ("BUY","SELL"):
+                emoji = "🟢" if r["signal"]=="BUY" else "🔴"
+                send(f"{emoji} <b>13/50 — {r['signal']}</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                     f"📌 Stock : <b>{symbol}</b>\n"
+                     f"💰 Entry : ₹{r['entry']}\n"
+                     f"🔴 SL    : ₹{r['sl']}\n"
+                     f"🟢 TP    : ₹{r['tp']}\n"
+                     f"📊 A/D   : {adv}/{dec} ({ad_ratio})\n"
+                     f"📝 {r['reason']}\n"
+                     f"🕐 {time_str()}",
+                     token=BOT2_TOKEN, chat_id=BOT2_CHAT_ID)
+        except Exception as e:
+            results.append({"symbol":symbol,"signal":"SKIP","reason":str(e),
+                            "entry":0,"sl":0,"tp":0,"atr":0,"ad_ratio":ad_ratio,"market_dir":market_dir})
+    order = {"BUY":0,"SELL":1,"SKIP":2}
+    results.sort(key=lambda x: order.get(x["signal"],2))
+    _1350_signals = results; _1350_scan_time = time_str()
+    b=sum(1 for r in results if r["signal"]=="BUY")
+    s=sum(1 for r in results if r["signal"]=="SELL")
+    print(f"✅ 13/50 scan done BUY:{b} SELL:{s}")
+
+# ─────────────────────────────────────────────
+#  GAP D/U STRATEGY
+#  Gap up/down at open + 1st 5min candle + EMA + ATR exit
+# ─────────────────────────────────────────────
+GAP_MIN_PCT = 0.3   # minimum gap % to qualify
+
+def check_gap_signal(symbol, market_dir, ad_ratio):
+    res = {"symbol":symbol,"signal":"SKIP","reason":"","entry":0,"sl":0,"tp":0,"atr":0,"gap_pct":0}
+    df = fetch_candles(symbol)
+    if df is None: res["reason"]="No data"; return res
+    df["ema13"] = calc_ema(df["close"],13)
+    df["ema50"] = calc_ema(df["close"],50)
+    df["atr"]   = calc_atr(df)
+    df = df.dropna(subset=["ema13","ema50","atr"])
+    if len(df)<3: res["reason"]="Not enough data"; return res
+
+    # Identify today's 1st 5-min candle (9:15 AM IST)
+    try:
+        import pandas as pd
+        today = datetime.now(IST).date()
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+        today_df = df[df.index.date == today]
+        if len(today_df) < 1: res["reason"]="No today candles"; return res
+        first = today_df.iloc[0]   # 1st 5-min candle
+    except Exception as e:
+        res["reason"]=f"Date filter error: {e}"; return res
+
+    # Previous close = last candle from prior day
+    prev_df = df[df.index.date < today]
+    if len(prev_df) < 1: res["reason"]="No prev close"; return res
+    prev_close = float(prev_df.iloc[-1]["close"])
+
+    first_open  = float(first["open"])
+    first_close = float(first["close"])
+    first_high  = float(first["high"])
+    first_low   = float(first["low"])
+    atr = float(df.iloc[-1]["atr"])
+    e13 = float(df.iloc[-1]["ema13"])
+    e50 = float(df.iloc[-1]["ema50"])
+
+    gap_pct = round((first_open - prev_close) / prev_close * 100, 2)
+    res["gap_pct"] = gap_pct
+    res["atr"] = round(atr, 2)
+
+    # Gap Up → BUY setup
+    if gap_pct >= GAP_MIN_PCT:
+        # 1st candle must be GREEN
+        if first_close <= first_open:
+            res["reason"]=f"Gap Up {gap_pct}% but 1st candle RED"; return res
+        # EMA13 > EMA50 (bullish alignment)
+        if e13 <= e50:
+            res["reason"]=f"Gap Up but EMA13<EMA50 (bearish)"; return res
+        # Market bias
+        if ad_ratio < 1.0:
+            res["reason"]=f"Gap Up but market bearish A/D={ad_ratio:.2f}"; return res
+        entry = round(first_close, 2)
+        res.update({
+            "signal":"BUY",
+            "entry": entry,
+            "sl":    round(first_low - ATR_SL_MULT*atr, 2),
+            "tp":    round(entry + ATR_TP_MULT*atr, 2),
+            "reason":f"Gap Up {gap_pct}% | Green 1st candle | EMA bullish | A/D={ad_ratio:.2f}"
+        })
+        return res
+
+    # Gap Down → SELL setup
+    if gap_pct <= -GAP_MIN_PCT:
+        # 1st candle must be RED
+        if first_close >= first_open:
+            res["reason"]=f"Gap Down {gap_pct}% but 1st candle GREEN"; return res
+        # EMA13 < EMA50 (bearish alignment)
+        if e13 >= e50:
+            res["reason"]=f"Gap Down but EMA13>EMA50 (bullish)"; return res
+        # Market bias
+        if ad_ratio > 1.0:
+            res["reason"]=f"Gap Down but market bullish A/D={ad_ratio:.2f}"; return res
+        entry = round(first_close, 2)
+        res.update({
+            "signal":"SELL",
+            "entry": entry,
+            "sl":    round(first_high + ATR_SL_MULT*atr, 2),
+            "tp":    round(entry - ATR_TP_MULT*atr, 2),
+            "reason":f"Gap Down {gap_pct}% | Red 1st candle | EMA bearish | A/D={ad_ratio:.2f}"
+        })
+        return res
+
+    res["reason"]=f"No gap (gap={gap_pct}%, min={GAP_MIN_PCT}%)"
+    return res
+
+def run_gap_scan():
+    global _gap_signals, _gap_scan_time
+    print(f"📐 Gap D/U scan {time_str()}")
+    market_dir = get_nifty_direction()
+    nse = fetch_nse_data()
+    adv = nse.get("advances",1); dec = nse.get("declines",1)
+    ad_ratio = round(adv / max(dec,1), 2)
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = check_gap_signal(symbol, market_dir, ad_ratio)
+            r["market_dir"] = market_dir
+            results.append(r)
+            if r["signal"] in ("BUY","SELL"):
+                emoji = "🟢" if r["signal"]=="BUY" else "🔴"
+                send(f"{emoji} <b>Gap D/U — {r['signal']}</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                     f"📌 Stock  : <b>{symbol}</b>\n"
+                     f"💰 Entry  : ₹{r['entry']}\n"
+                     f"🔴 SL     : ₹{r['sl']}\n"
+                     f"🟢 TP     : ₹{r['tp']}\n"
+                     f"📐 Gap    : {r['gap_pct']}%\n"
+                     f"📝 {r['reason']}\n"
+                     f"🕐 {time_str()}",
+                     token=BOT2_TOKEN, chat_id=BOT2_CHAT_ID)
+        except Exception as e:
+            results.append({"symbol":symbol,"signal":"SKIP","reason":str(e),
+                                                        "entry":0,"sl":0,"tp":0,"atr":0,"gap_pct":0,"market_dir":market_dir})
+    order = {"BUY":0,"SELL":1,"SKIP":2}
+    results.sort(key=lambda x: order.get(x["signal"],2))
+    _gap_signals = results; _gap_scan_time = time_str()
+    b=sum(1 for r in results if r["signal"]=="BUY")
+    s=sum(1 for r in results if r["signal"]=="SELL")
+    print(f"✅ Gap scan done BUY:{b} SELL:{s}")
+
+# ─────────────────────────────────────────────
+#  PRO ENGINE — 7-Filter Confluence Strategy
+# ─────────────────────────────────────────────
+def calc_rsi(series, period=14):
+    """Pure-pandas RSI calculation."""
+    try:
+        delta  = series.diff()
+        gain   = delta.clip(lower=0).rolling(period).mean()
+        loss   = (-delta.clip(upper=0)).rolling(period).mean()
+        rs     = gain / loss.replace(0, 1e-10)
+        return 100 - (100 / (1 + rs))
+    except: return None
+
+def pro_check_signal(symbol, nifty_dir):
+    """
+    7-Filter Confluence — returns dict with signal, score (0-7), details.
+    BUY  needs score == 7  (all filters green)
+    SELL needs score == 7  (all filters green, mirrored)
+    """
+    result = {
+        "symbol": symbol, "signal": "SKIP", "score": 0,
+        "entry": 0, "sl": 0, "tp1": 0, "tp2": 0,
+        "rr": 0, "atr": 0, "rsi": 0, "adx": 0,
+        "reason": "", "filters": []
+    }
+    df = fetch_candles(symbol)
+    if df is None:
+        result["reason"] = "No data"; return result
+
+    df["ema13"] = calc_ema(df["close"], 13)
+    df["ema50"] = calc_ema(df["close"], 50)
+    df["atr"]   = calc_atr(df, 14)
+    adx_s       = calc_adx(df, 14)
+    df["adx"]   = adx_s if adx_s is not None else 0.0
+    rsi_s       = calc_rsi(df["close"], 14)
+    df["rsi"]   = rsi_s if rsi_s is not None else 50.0
+    df["vol_ma"] = df["volume"].rolling(20).mean()
+    df = df.dropna(subset=["ema13","ema50","atr","adx","rsi","vol_ma"])
+    if len(df) < 3:
+        result["reason"] = "Not enough data"; return result
+
+    cur  = df.iloc[-1]; prev = df.iloc[-2]
+    close= float(cur["close"]); opn  = float(cur["open"])
+    high = float(cur["high"]);  low  = float(cur["low"])
+    e13c = float(cur["ema13"]); e50c = float(cur["ema50"])
+    e13p = float(prev["ema13"]);e50p = float(prev["ema50"])
+    atr  = float(cur["atr"]);   adx  = float(cur["adx"])
+    rsi  = float(cur["rsi"]);   vol  = float(cur["volume"])
+    vol_ma = float(cur["vol_ma"])
+
+    result["entry"] = round(close, 2)
+    result["atr"]   = round(atr, 2)
+    result["rsi"]   = round(rsi, 1)
+    result["adx"]   = round(adx, 1)
+
+    t_now = now_ist()
+    in_window = PRO_TRADE_START <= t_now <= PRO_TRADE_END
+
+    crossed_up   = (e13p <= e50p) and (e13c > e50c)
+    crossed_down = (e13p >= e50p) and (e13c < e50c)
+    direction    = "BUY" if crossed_up else ("SELL" if crossed_down else None)
+    if direction is None:
+        result["reason"] = "No EMA crossover"; return result
+
+    filters = []
+    score   = 0
+
+    f1 = (e13c > e50c) if direction=="BUY" else (e13c < e50c)
+    filters.append(("EMA Trend",    "✅" if f1 else "❌",
+                    f"EMA13={'above' if e13c>e50c else 'below'} EMA50"))
+    if f1: score += 1
+
+    f2 = crossed_up if direction=="BUY" else crossed_down
+    filters.append(("EMA Crossover","✅" if f2 else "❌", "Fresh cross this candle"))
+    if f2: score += 1
+
+    f3 = adx >= PRO_ADX_MIN
+    filters.append(("ADX Strength", "✅" if f3 else "❌", f"ADX={adx:.1f} (need >{PRO_ADX_MIN})"))
+    if f3: score += 1
+
+    if direction == "BUY":
+        f4 = PRO_RSI_BUY_LO <= rsi <= PRO_RSI_BUY_HI
+        filters.append(("RSI Momentum","✅" if f4 else "❌",
+                        f"RSI={rsi:.1f} (need {PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI})"))
+    else:
+        f4 = PRO_RSI_SELL_LO <= rsi <= PRO_RSI_SELL_HI
+        filters.append(("RSI Momentum","✅" if f4 else "❌",
+                        f"RSI={rsi:.1f} (need {PRO_RSI_SELL_LO}-{PRO_RSI_SELL_HI})"))
+    if f4: score += 1
+
+    f5 = vol >= PRO_VOL_MULT * vol_ma if vol_ma > 0 else False
+    filters.append(("Volume Surge", "✅" if f5 else "❌",
+                    f"Vol={int(vol):,} vs avg={int(vol_ma):,} (need {PRO_VOL_MULT}x)"))
+    if f5: score += 1
+
+    f6 = (nifty_dir == "UP") if direction=="BUY" else (nifty_dir == "DOWN")
+    filters.append(("Nifty Aligned","✅" if f6 else "❌", f"Nifty={nifty_dir}"))
+    if f6: score += 1
+
+    rng = high - low
+    if rng > 0:
+        body   = abs(close - opn) / rng
+        shadow = ((high - max(close,opn)) + (min(close,opn) - low)) / rng
+        f7 = (body >= PRO_BODY_MIN) and (shadow <= PRO_SHADOW_MAX)
+        filters.append(("Candle Quality","✅" if f7 else "❌",
+                        f"Body={body:.0%} Shadow={shadow:.0%}"))
+    else:
+        f7 = False
+        filters.append(("Candle Quality","❌","Doji candle"))
+    if f7: score += 1
+
+    result["score"]   = score
+    result["filters"] = filters
+
+    if score < 7:
+        failed = [f[0] for f in filters if f[1]=="❌"]
+        result["reason"] = f"Score {score}/7 — Failed: {', '.join(failed)}"
+        return result
+
+    if not in_window:
+        result["reason"] = f"Score 7/7 but outside trade window (9:30-14:30)"
+        result["signal"] = "WATCH"
+        return result
+
+    if direction == "BUY":
+        sl  = round(close - PRO_ATR_SL  * atr, 2)
+        tp1 = round(close + PRO_ATR_TP1 * atr, 2)
+        tp2 = round(close + PRO_ATR_TP2 * atr, 2)
+    else:
+        sl  = round(close + PRO_ATR_SL  * atr, 2)
+        tp1 = round(close - PRO_ATR_TP1 * atr, 2)
+        tp2 = round(close - PRO_ATR_TP2 * atr, 2)
+
+    risk   = abs(close - sl)
+    reward = abs(tp1   - close)
+    rr     = round(reward / risk, 2) if risk > 0 else 0
+
+    if rr < PRO_MIN_RR:
+        result["reason"] = f"Score 7/7 but R:R={rr} < {PRO_MIN_RR} minimum"
+        return result
+
+    result.update({
+        "signal": direction,
+        "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr,
+        "reason": f"7/7 ✅ | ADX={adx:.1f} RSI={rsi:.1f} Vol={int(vol/vol_ma*100) if vol_ma else 0}% R:R=1:{rr}"
+    })
+    return result
+
+def run_pro_scan():
+    global _pro_signals, _pro_scan_time, _pro_nifty_dir
+    print(f"🎯 Pro scan {time_str()}")
+    nifty_dir = get_nifty_direction()
+    _pro_nifty_dir = nifty_dir
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = pro_check_signal(symbol, nifty_dir)
+            r["market_dir"] = nifty_dir
+            results.append(r)
+        except Exception as e:
+            results.append({
+                "symbol": symbol, "signal": "SKIP", "score": 0,
+                "entry": 0, "sl": 0, "tp1": 0, "tp2": 0, "rr": 0,
+                "atr": 0, "rsi": 0, "adx": 0,
+                "reason": str(e), "filters": [], "market_dir": nifty_dir
+            })
+    order = {"BUY":0,"SELL":1,"WATCH":2,"SKIP":3}
+    results.sort(key=lambda x: (order.get(x["signal"],3), -x["score"]))
+    _pro_signals   = results
+    _pro_scan_time = time_str()
+    buys  = sum(1 for r in results if r["signal"]=="BUY")
+    sells = sum(1 for r in results if r["signal"]=="SELL")
+    watch = sum(1 for r in results if r["signal"]=="WATCH")
+    print(f"🎯 Pro scan done BUY:{buys} SELL:{sells} WATCH:{watch}")
+    for r in results:
+        if r["signal"] in ("BUY","SELL"):
+            emoji = "🟢" if r["signal"]=="BUY" else "🔴"
+            send(f"{emoji} <b>PRO ENGINE — {r['signal']}</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                 f"📌 Stock  : <b>{r['symbol']}</b>\n"
+                 f"💰 Entry  : ₹{r['entry']}\n"
+                 f"🔴 SL     : ₹{r['sl']}\n"
+                 f"🎯 TP1    : ₹{r['tp1']} (50% exit)\n"
+                 f"🚀 TP2    : ₹{r['tp2']} (trail 50%)\n"
+                 f"📊 Score  : {r['score']}/7\n"
+                 f"⚖️  R:R    : 1:{r['rr']}\n"
+                 f"🕐 {time_str()}",
+                 token=BOT2_TOKEN, chat_id=BOT2_CHAT_ID)
+
+# ─────────────────────────────────────────────
+#  BOT 1 — tazbul
+# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  SUPERTREND + ADX STRATEGY  (1-min candles)
+# ═══════════════════════════════════════════════════════════════
+def calc_supertrend(df, period, multiplier):
+    """
+    Returns df with two new columns:
+      ST_val  — supertrend line value
+      ST_dir  — 'up' (bullish) or 'down' (bearish)
+    Uses ATR-based upper/lower bands, classic SuperTrend algorithm.
+    """
+    import numpy as np
+    high = df["high"].values
+    low  = df["low"].values
+    close= df["close"].values
+    n    = len(df)
+
+    # True Range
+    tr = np.zeros(n)
+    for i in range(1, n):
+        tr[i] = max(high[i]-low[i],
+                    abs(high[i]-close[i-1]),
+                    abs(low[i] -close[i-1]))
+
+    # ATR via Wilder smoothing
+    atr = np.zeros(n)
+    atr[period] = np.mean(tr[1:period+1])
+    for i in range(period+1, n):
+        atr[i] = (atr[i-1]*(period-1) + tr[i]) / period
+
+    # Basic bands
+    ub = (high + low) / 2 + multiplier * atr
+    lb = (high + low) / 2 - multiplier * atr
+
+    # Final bands & SuperTrend
+    final_ub = np.copy(ub)
+    final_lb = np.copy(lb)
+    st       = np.zeros(n)
+    direction= ["up"] * n   # up = bullish (price above ST)
+
+    for i in range(period+1, n):
+        # Final upper band
+        if ub[i] < final_ub[i-1] or close[i-1] > final_ub[i-1]:
+            final_ub[i] = ub[i]
+        else:
+            final_ub[i] = final_ub[i-1]
+        # Final lower band
+        if lb[i] > final_lb[i-1] or close[i-1] < final_lb[i-1]:
+            final_lb[i] = lb[i]
+        else:
+            final_lb[i] = final_lb[i-1]
+        # SuperTrend value
+        if st[i-1] == final_ub[i-1] and close[i] <= final_ub[i]:
+            st[i] = final_ub[i]; direction[i] = "down"
+        elif st[i-1] == final_ub[i-1] and close[i] > final_ub[i]:
+            st[i] = final_lb[i]; direction[i] = "up"
+        elif st[i-1] == final_lb[i-1] and close[i] >= final_lb[i]:
+            st[i] = final_lb[i]; direction[i] = "up"
+        elif st[i-1] == final_lb[i-1] and close[i] < final_lb[i]:
+            st[i] = final_ub[i]; direction[i] = "down"
+        else:
+            st[i] = final_lb[i]; direction[i] = "up"
+
+    df = df.copy()
+    df["ST_val"] = st
+    df["ST_dir"] = direction
+    df["ST_atr"] = atr
+    return df
+
+
+def check_supertrend_signal(symbol):
+    """
+    1-min Supertrend + ADX signal check.
+    BUY  : ST flips down→up  AND  ADX ≥ ST_ADX_MIN
+    SELL : ST flips up→down  AND  ADX ≥ ST_ADX_MIN
+    Returns dict with signal, entry, sl, tp, atr, adx, reason.
+    """
+    res = {"symbol": symbol, "signal": "SKIP",
+           "entry": 0, "sl": 0, "tp": 0, "atr": 0, "adx": 0, "reason": ""}
+    df = fetch_candles_1m(symbol)
+    if df is None:
+        res["reason"] = "No 1m data"; return res
+    if len(df) < ST_PERIOD + 10:
+        res["reason"] = f"Not enough candles ({len(df)})"; return res
+
+    try:
+        df = calc_supertrend(df, ST_PERIOD, ST_MULTIPLIER)
+    except Exception as e:
+        res["reason"] = f"ST calc error: {e}"; return res
+
+    # ADX on 1-min candles (14-period)
+    adx_s = calc_adx(df, 14)
+    adx   = float(adx_s.iloc[-1]) if adx_s is not None else 0.0
+
+    cur  = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    close    = float(cur["close"])
+    atr_val  = float(cur["ST_atr"])
+    cur_dir  = cur["ST_dir"]
+    prev_dir = prev["ST_dir"]
+
+    res["entry"] = round(close, 2)
+    res["atr"]   = round(atr_val, 2)
+    res["adx"]   = round(adx, 1)
+
+    if adx < ST_ADX_MIN:
+        res["reason"] = f"Ranging — ADX={adx:.1f} < {ST_ADX_MIN}"; return res
+
+    flipped_up   = (prev_dir == "down" and cur_dir == "up")
+    flipped_down = (prev_dir == "up"   and cur_dir == "down")
+
+    if not flipped_up and not flipped_down:
+        res["reason"] = f"No flip — ST={cur_dir} | ADX={adx:.1f}"; return res
+
+    if flipped_up:
+        sl = round(close - ST_ATR_SL * atr_val, 2)
+        tp = round(close + ST_ATR_TP * atr_val, 2)
+        res.update({"signal": "BUY", "sl": sl, "tp": tp,
+                    "reason": f"ST flip down→up | ADX={adx:.1f} | 1m"})
+    else:
+        sl = round(close + ST_ATR_SL * atr_val, 2)
+        tp = round(close - ST_ATR_TP * atr_val, 2)
+        res.update({"signal": "SELL", "sl": sl, "tp": tp,
+                    "reason": f"ST flip up→down | ADX={adx:.1f} | 1m"})
+    return res
+
+
+def run_st_scan():
+    global _st_signals, _st_scan_time
+    print(f"🕯️ ST+ADX Scan {time_str()}")
+    results = []
+    for symbol in NIFTY50:
+        try:
+            r = check_supertrend_signal(symbol)
+            results.append(r)
+            if r["signal"] in ("BUY", "SELL"):
+                emoji = "🟢" if r["signal"] == "BUY" else "🔴"
+                send(f"{emoji} <b>SUPERTREND+ADX — {r['signal']}</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                     f"📌 Stock  : <b>{symbol}</b>\n"
+                     f"💵 Entry  : ₹{r['entry']}\n"
+                     f"🔴 SL     : ₹{r['sl']}\n"
+                     f"🎯 TP     : ₹{r['tp']}\n"
+                     f"📊 ADX    : {r['adx']} | ATR: {r['atr']}\n"
+                     f"💡 Reason : {r['reason']}\n"
+                     f"⏰ {time_str()}")
+        except Exception as e:
+            results.append({"symbol": symbol, "signal": "SKIP",
+                            "entry": 0, "sl": 0, "tp": 0,
+                            "atr": 0, "adx": 0, "reason": str(e)})
+    _st_signals   = results
+    _st_scan_time = time_str()
+    buys  = sum(1 for r in results if r["signal"] == "BUY")
+    sells = sum(1 for r in results if r["signal"] == "SELL")
+    print(f"✅ ST+ADX scan done BUY:{buys} SELL:{sells} SKIP:{len(results)-buys-sells}")
+
+
+# ═══════════════════════════════════════════════════════════════
+def open_trade(symbol, price):
+    if symbol in open_trades or symbol in traded_today: return
+    trade=calculate_trade(symbol,price,SL_PERCENT,TP_PERCENT,CAPITAL_PER_TRADE)
+    open_trades[symbol]=trade; traded_today.add(symbol)
+    atr_tag = f"₹{trade['atr_val']}" if trade.get('atr_val') else "calculating…"
+    send(f"📝 <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} ENTRY — tazbul</b>\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"📌 Stock : <b>{symbol}</b>\n"
+         f"💰 Entry : ₹{price}\n"
+         f"📦 Qty   : {trade['qty']}\n"
+         f"🔴 ATR SL: ₹{trade['sl']} (ATR×{ATR_MULT}={atr_tag})\n"
+         f"🟢 TP    : ₹{trade['tp']} ({TP_PERCENT}%) → trail\n"
+         f"💵 Cap   : ₹{trade['capital_used']}\n"
+         f"🕐 {trade['entry_time']}")
+
+def close_trade(symbol, exit_price, reason):
+    if symbol not in open_trades: return
+    trade=open_trades.pop(symbol); trade["exit_time"]=time_str()
+    gross_pnl = round((exit_price-trade["entry"])*trade["qty"],2)
+    charges   = calc_charges(trade["entry"],exit_price,trade["qty"])
+    net_pnl   = round(gross_pnl-charges,2)
+    send(f"{'✅' if net_pnl>=0 else '❌'} <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} EXIT — tazbul</b>\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"📌 Stock    : <b>{symbol}</b>\n"
+         f"💰 Entry    : ₹{trade['entry']} → ₹{exit_price}\n"
+         f"💹 Gross P&L: {'+'if gross_pnl>=0 else ''}₹{gross_pnl}\n"
+         f"🏦 Charges  : -₹{charges} (Dhan)\n"
+         f"{'💚' if net_pnl>=0 else '❤️'} Net P&L  : {'+'if net_pnl>=0 else ''}₹{net_pnl}\n"
+         f"📝 {reason}\n🕐 {trade['exit_time']}")
+    closed_today.append({"symbol":symbol,"pnl":net_pnl,"charges":charges,"gross_pnl":gross_pnl})
+    log_trade(trade,exit_price,gross_pnl,charges,net_pnl,reason,"logs/trades.csv")
+
+def check_positions():
+    for sym in list(open_trades):
+        t=open_trades.get(sym)
+        if not t: continue
+        p=get_price(sym)
+        if not p: continue
+        changed=False
+        # Update ATR trailing SL
+        candles=fetch_candles(sym)
+        new_sl,new_atr=calc_atr_sl(candles,current_atr_sl=t["sl"])
+        if new_sl and new_sl!=t["sl"]:
+            t["sl"]=new_sl; t["atr_val"]=new_atr; changed=True
+        # Trailing TP logic
+        if not t.get("tp_hit"):
+            if p>=t["tp"]:
+                t["tp_hit"]=True; t["trail_tp"]=round(p*(1+TP_PERCENT/100),2); changed=True
+                send(f"🎯 <b>First TP Hit — Trail TP Active</b>\n📌 {sym} @ ₹{p}\n📈 Trail TP: ₹{t['trail_tp']}\n🔴 ATR SL: ₹{t['sl']}")
+        else:
+            new_trail=round(p*(1+TP_PERCENT/100),2)
+            if new_trail>t["trail_tp"]: t["trail_tp"]=new_trail; changed=True
+            if p<=round(t["trail_tp"]/(1+TP_PERCENT/100),2):
+                if changed: open_trades[sym]=t
+                close_trade(sym,p,"📈 Trailing TP Exit"); continue
+        if p<=t["sl"]:
+            if changed: open_trades[sym]=t
+            close_trade(sym,p,"🔴 ATR Trailing SL Hit" if not t.get("tp_hit") else "🔴 ATR SL Hit (after TP)"); continue
+        if changed: open_trades[sym]=t
+
+def send_eod():
+    w=[t for t in closed_today if t["pnl"]>=0]; l=[t for t in closed_today if t["pnl"]<0]
+    gross   =round(sum(t.get("gross_pnl",t["pnl"]) for t in closed_today),2)
+    total_ch=round(sum(t.get("charges",0)          for t in closed_today),2)
+    net     =round(sum(t["pnl"]                    for t in closed_today),2)
+    send(f"📋 <b>EOD — tazbul</b>\n"
+         f"📅 {datetime.now(IST).strftime('%d %b %Y')}\n"
+         f"📊 Trades:{len(closed_today)} ✅{len(w)} ❌{len(l)}\n"
+         f"💹 Gross: {'+'if gross>=0 else ''}₹{gross}\n"
+         f"🏦 Charges: -₹{total_ch} (Dhan)\n"
+         f"{'💚' if net>=0 else '❤️'} Net: {'+'if net>=0 else ''}₹{net}")
+    closed_today.clear(); traded_today.clear()
+
+# ─────────────────────────────────────────────
+#  BOT 2 — TazAmol-Test1
+# ─────────────────────────────────────────────
+def open_trade2(symbol, price):
+    if symbol in open_trades2 or symbol in traded_today2: return
+    trade=calculate_trade(symbol,price,BOT2_SL,BOT2_TP,BOT2_CAPITAL)
+    open_trades2[symbol]=trade; traded_today2.add(symbol)
+    send(f"📝 <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} ENTRY — TazAmol</b>\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"📌 Stock : <b>{symbol}</b>\n"
+         f"💰 Entry : ₹{price}\n"
+         f"📦 Qty   : {trade['qty']}\n"
+         f"🔴 SL    : ₹{trade['sl']}\n"
+         f"🟢 TP    : ₹{trade['tp']}\n"
+         f"💵 Cap   : ₹{trade['capital_used']}\n"
+         f"🕐 {trade['entry_time']}",
+         token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+
+def close_trade2(symbol, exit_price, reason):
+    if symbol not in open_trades2: return
+    trade=open_trades2.pop(symbol); trade["exit_time"]=time_str()
+    pnl=round((exit_price-trade["entry"])*trade["qty"],2)
+    send(f"{'✅' if pnl>=0 else '❌'} <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} EXIT — TazAmol</b>\n"
+         f"━━━━━━━━━━━━━━━━━━━━\n"
+         f"📌 Stock : <b>{symbol}</b>\n"
+         f"💰 Entry : ₹{trade['entry']} → ₹{exit_price}\n"
+         f"{'💚' if pnl>=0 else '❤️'} P&L  : ₹{abs(pnl)}\n"
+         f"📝 {reason}\n🕐 {trade['exit_time']}",
+         token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+    closed_today2.append({"symbol":symbol,"pnl":pnl})
+    log_trade(trade,exit_price,pnl,reason,"logs/trades2.csv")
+
+def check_positions2():
+    for sym in list(open_trades2):
+        t=open_trades2.get(sym)
+        if not t: continue
+        p=get_price(sym)
+        if not p: continue
+        if p>=t["tp"]: close_trade2(sym,p,"🎯 Take Profit")
+        elif p<=t["sl"]: close_trade2(sym,p,"🔴 Stop Loss")
+
+def send_eod2():
+    w=[t for t in closed_today2 if t["pnl"]>=0]; l=[t for t in closed_today2 if t["pnl"]<0]
+    net=round(sum(t["pnl"] for t in closed_today2),2)
+    send(f"📋 <b>EOD — TazAmol-Test1</b>\n"
+         f"📅 {datetime.now(IST).strftime('%d %b %Y')}\n"
+         f"📊 Trades:{len(closed_today2)} ✅{len(w)} ❌{len(l)}\n"
+         f"{'💚' if net>=0 else '❤️'} Net: ₹{net}",
+         token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+    closed_today2.clear(); traded_today2.clear()
+
+# ─────────────────────────────────────────────
+#  MONITOR
+# ─────────────────────────────────────────────
+def run_monitor():
+    eod_sent=False; last_scan_min=-1
+    print("📈 Monitor started")
+    while True:
+        try:
+            t=now_ist(); cur_min=datetime.now(IST).minute
+            if t>=FORCE_EXIT:
+                if open_trades:
+                    send("⏰ <b>Force closing tazbul!</b>")
+                    for s in list(open_trades): close_trade(s,get_price(s) or open_trades[s]["entry"],"⏰ Force Exit")
+                if open_trades2:
+                    send("⏰ <b>Force closing TazAmol!</b>",token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+                    for s in list(open_trades2): close_trade2(s,get_price(s) or open_trades2[s]["entry"],"⏰ Force Exit")
+            if t>=MARKET_CLOSE and not eod_sent:
+                send_eod(); send_eod2(); eod_sent=True
+            if t<dtime(9,0): eod_sent=False
+            if is_market_hours():
+                if open_trades: check_positions()
+                if open_trades2: check_positions2()
+                if cur_min%5==0 and cur_min!=last_scan_min:
+                    last_scan_min=cur_min
+                    threading.Thread(target=run_signal_scan,daemon=True).start()
+                    threading.Thread(target=run_pro_scan,daemon=True).start()
+                    threading.Thread(target=run_1350_scan,daemon=True).start()
+                    threading.Thread(target=run_gap_scan,daemon=True).start()
+                    threading.Thread(target=run_st_scan,daemon=True).start()
+        except Exception as e: print(f"❌ Monitor: {e}")
+        time.sleep(60)
+
+# ─────────────────────────────────────────────
+#  ROUTES
+# ─────────────────────────────────────────────
+def parse_alert_data():
+    data = request.get_json(force=True, silent=True)
+    if data:
+        return data
+    if request.form:
+        return request.form.to_dict()
+    try:
+        from urllib.parse import parse_qs
+        raw = request.data.decode("utf-8")
+        parsed = parse_qs(raw)
+        return {k: v[0] for k, v in parsed.items()}
+    except: pass
+    return {}
+
+def parse_stocks_prices(data):
+    raw_stocks = data.get("stocks","")
+    raw_prices = data.get("trigger_prices","")
+    stocks = [s.strip().upper() for s in raw_stocks.replace(","," ").split() if s.strip()]
+    prices = [p.strip() for p in raw_prices.replace(","," ").split() if p.strip()]
+    return stocks, prices
+
+@app.route("/alert",methods=["POST"])
+def receive_alert():
+    data = parse_alert_data()
+    print(f"📥 /alert data: {data}")
+    stocks, prices = parse_stocks_prices(data)
+    if not stocks: return jsonify({"status":"no stocks","received":str(data)}),400
+    results=[]
+    for i,sym in enumerate(stocks):
+        if sym in traded_today or sym in open_trades:
+            results.append({"symbol":sym,"status":"skip"}); continue
+        price=get_price(sym,prices[i] if i<len(prices) else None)
+        if not price:
+            send(f"❌ Price failed: {sym}"); results.append({"symbol":sym,"status":"price failed"}); continue
+        open_trade(sym,price); results.append({"symbol":sym,"status":"entered","price":price})
+    return jsonify({"status":"processed","results":results}),200
+
+@app.route("/alert2",methods=["POST"])
+def receive_alert2():
+    data = parse_alert_data()
+    print(f"📥 /alert2 data: {data}")
+    stocks, prices = parse_stocks_prices(data)
+    if not stocks: return jsonify({"status":"no stocks","received":str(data)}),400
+    results=[]
+    for i,sym in enumerate(stocks):
+        if sym in traded_today2 or sym in open_trades2:
+            results.append({"symbol":sym,"status":"skip"}); continue
+        price=get_price(sym,prices[i] if i<len(prices) else None)
+        if not price:
+            send(f"❌ Price failed: {sym}",token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+            results.append({"symbol":sym,"status":"price failed"}); continue
+        open_trade2(sym,price); results.append({"symbol":sym,"status":"entered","price":price})
+    return jsonify({"status":"processed","results":results}),200
+
+@app.route("/scan",methods=["GET"])
+def manual_scan():
+    threading.Thread(target=run_signal_scan,daemon=True).start()
+    return jsonify({"status":"scan started"}),200
+
+@app.route("/scan-1350",methods=["GET"])
+def scan_1350_route():
+    threading.Thread(target=run_1350_scan,daemon=True).start()
+    return jsonify({"status":"13/50 scan started"}),200
+
+@app.route("/scan-gap",methods=["GET"])
+def scan_gap_route():
+    threading.Thread(target=run_gap_scan,daemon=True).start()
+    return jsonify({"status":"Gap D/U scan started"}),200
+
+@app.route("/pro-scan",methods=["GET"])
+def pro_scan_route():
+    threading.Thread(target=run_pro_scan,daemon=True).start()
+    return jsonify({"status":"pro scan started"}),200
+
+@app.route("/scan-supertrend",methods=["GET"])
+def scan_supertrend_route():
+    threading.Thread(target=run_st_scan,daemon=True).start()
+    return jsonify({"status":"Supertrend+ADX scan started"}),200
+
+@app.route("/nse-data",methods=["GET"])
+def nse_data_api():
+    return jsonify(fetch_nse_data()),200
+
+@app.route("/",methods=["GET"])
+def home():
+    return jsonify({"status":"🟢 Running","time_ist":time_str(),
+                    "market_open":is_market_hours(),"last_scan":_last_scan_time}),200
+
+@app.route("/test",methods=["GET"])
+def test():
+    send(f"✅ Bot1 tazbul OK 🕐{time_str()}")
+    send(f"✅ Bot2 TazAmol-Test1 OK 🕐{time_str()}",token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
+    return jsonify({"status":"sent"}),200
+
+@app.route("/report",methods=["GET"])
+def report():
+    send_eod(); send_eod2(); return jsonify({"status":"sent"}),200
+
+@app.route("/status",methods=["GET"])
+def status():
+    return jsonify({
+        "bot1":{"open":list(open_trades),"closed":len(closed_today),"pnl":round(sum(t["pnl"] for t in closed_today),2)},
+        "bot2":{"open":list(open_trades2),"closed":len(closed_today2),"pnl":round(sum(t["pnl"] for t in closed_today2),2)},
+    }),200
+    # ─────────────────────────────────────────────
+#  DASHBOARD HELPERS
+# ─────────────────────────────────────────────
+def load_csv(path):
+    if not os.path.exists(path): return []
+    with open(path,newline="") as f: return list(csv.DictReader(f))
+
+def stats(rows):
+    w=[r for r in rows if r.get("result")=="WIN"]; l=[r for r in rows if r.get("result")=="LOSS"]
+    net=round(sum(float(r.get("net_pnl",r.get("pnl",0))) for r in rows),2)
+    gp=round(sum(float(r.get("net_pnl",r.get("pnl",0))) for r in w),2)
+    gl=round(abs(sum(float(r.get("net_pnl",r.get("pnl",0))) for r in l)),2)
+    wr=round(len(w)/len(rows)*100 if rows else 0,1)
+    return w,l,net,gp,gl,wr
+
+def tbl_open(d, bot_num):
+    if not d:
+        return '<tr><td colspan="10" style="text-align:center;color:#8b949e;padding:20px;">No open positions</td></tr>'
+    rows=""
+    for s,t in d.items():
+        tp_hit   = t.get("tp_hit", False)
+        trail_tp = t.get("trail_tp")
+        atr_val  = t.get("atr_val","—")
+        tp_disp  = f"&#8377;{trail_tp} &#128260;" if tp_hit and trail_tp else f"&#8377;{t['tp']}"
+        tp_col   = "#58a6ff" if tp_hit else "#00c896"
+        rows += (f'<tr id="row-{bot_num}-{s}">'
+                 f'<td><b>{s}</b></td>'
+                 f'<td>&#8377;{t["entry"]}</td>'
+                 f'<td>{t["qty"]}</td>'
+                 f'<td style="color:#ff4d4d;" title="ATR({ATR_PERIOD})&#215;{ATR_MULT}=&#8377;{atr_val}">&#8377;{t["sl"]}</td>'
+                 f'<td style="color:{tp_col};">{tp_disp}</td>'
+                 f'<td>&#8377;{t["capital_used"]}</td>'
+                 f'<td id="ltp-{bot_num}-{s}" style="font-weight:700;">—</td>'
+                 f'<td id="upnl-{bot_num}-{s}">—</td>'
+                 f'<td>{t["entry_time"]}</td>'
+                 f'<td><button onclick="closePos(\'{bot_num}\',\'{s}\',this)" '
+                 f'style="background:#da3633;border:none;border-radius:5px;color:#fff;'
+                 f'padding:3px 10px;font-size:12px;cursor:pointer;">Close</button></td>'
+                 f'</tr>')
+    return rows
+
+def tbl_closed(rows):
+    if not rows: return '<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No closed trades today</td></tr>'
+    out=""
+    for r in reversed(rows):
+        gv=float(r.get("gross_pnl",r.get("pnl",0)))
+        ch=float(r.get("charges",0))
+        nv=float(r.get("net_pnl",r.get("pnl",0)))
+        c="#00c896" if nv>=0 else "#ff4d4d"; sg="+" if nv>=0 else ""; gsg="+" if gv>=0 else ""
+        out+=(f'<tr><td><b>{r["symbol"]}</b></td><td>&#8377;{r["entry"]}</td><td>&#8377;{r["exit"]}</td>'
+              f'<td>{r["qty"]}</td>'
+              f'<td>{gsg}&#8377;{gv}</td>'
+              f'<td style="color:#f59e0b;">-&#8377;{ch}</td>'
+              f'<td style="color:{c};font-weight:700;">{sg}&#8377;{nv}</td>'
+              f'<td>{r["reason"]}</td><td>{r["exit_time"]}</td></tr>')
+    return out
+
+def tbl_hist(rows):
+    if not rows: return '<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No history yet</td></tr>'
+    out=""
+    for r in reversed(rows[-50:]):
+        gv=float(r.get("gross_pnl",r.get("pnl",0)))
+        ch=float(r.get("charges",0))
+        nv=float(r.get("net_pnl",r.get("pnl",0)))
+        c="#00c896" if nv>=0 else "#ff4d4d"; sg="+" if nv>=0 else ""; gsg="+" if gv>=0 else ""
+        out+=(f'<tr><td>{r["date"]}</td><td><b>{r["symbol"]}</b></td><td>&#8377;{r["entry"]}</td>'
+              f'<td>&#8377;{r["exit"]}</td><td>{r["qty"]}</td>'
+              f'<td>{gsg}&#8377;{gv}</td>'
+              f'<td style="color:#f59e0b;">-&#8377;{ch}</td>'
+              f'<td style="color:{c};font-weight:700;">{sg}&#8377;{nv}</td>'
+              f'<td>{r.get("reason","")}</td></tr>')
+    return out
+
+
+def tbl_open_strat(d, strat):
+    if not d:
+        return '<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No open positions — click a signal row to open a trade</td></tr>'
+    rows=""
+    for s,t in d.items():
+        sig_c="#00c896" if t["signal"]=="BUY" else "#ff4d4d"
+        sig_ico="&#9650;" if t["signal"]=="BUY" else "&#9660;"
+        rows += (f'<tr id="strat-row-{strat}-{s}">'
+                 f'<td><b style="color:{sig_c};">{sig_ico} {t["signal"]}</b></td>'
+                 f'<td><b>{s}</b></td>'
+                 f'<td>&#8377;{t["entry"]}</td>'
+                 f'<td>{t["qty"]}</td>'
+                 f'<td style="color:#ff4d4d;">&#8377;{t["sl"]}</td>'
+                 f'<td style="color:#00c896;">&#8377;{t["tp"]}</td>'
+                 f'<td id="ltp-st-{strat}-{s}" style="font-weight:700;">—</td>'
+                 f'<td id="upnl-st-{strat}-{s}">—</td>'
+                 f'<td>{t["entry_time"]}</td>'
+                 f'<td><button onclick="closeStratPos(\'{strat}\',\'{s}\',this)" '
+                 f'style="background:#da3633;border:none;border-radius:5px;color:#fff;'
+                 f'padding:3px 10px;font-size:12px;cursor:pointer;">Close</button></td>'
+                 f'</tr>')
+    return rows
+
+def tbl_strat_closed(rows):
+    if not rows: return '<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No closed trades today</td></tr>'
+    out=""
+    for r in reversed(rows):
+        v=float(r["pnl"]); c="#00c896" if v>=0 else "#ff4d4d"; sg="+" if v>=0 else ""
+        sig_c="#00c896" if r.get("signal")=="BUY" else "#ff4d4d"
+        out+=f'<tr><td><b style="color:{sig_c};">{r.get("signal","")}</b></td><td><b>{r["symbol"]}</b></td><td>&#8377;{r["entry"]}</td><td>&#8377;{r["exit"]}</td><td>{r["qty"]}</td><td style="color:{c};font-weight:700;">{sg}&#8377;{v}</td><td>{r.get("reason","Manual")}</td><td>{r["exit_time"]}</td></tr>'
+    return out
+
+def strat_stats(closed):
+    today_str=datetime.now(IST).strftime("%Y-%m-%d")
+    td=[r for r in closed if r.get("date")==today_str]
+    w=[r for r in td if float(r["pnl"])>0]; l=[r for r in td if float(r["pnl"])<0]
+    net=round(sum(float(r["pnl"]) for r in td),2)
+    wr=round(len(w)/max(len(td),1)*100,1)
+    return td,w,l,net,wr
+
+
+def tbl_pro_signals(sigs):
+    buys  = [s for s in sigs if s["signal"]=="BUY"]
+    sells = [s for s in sigs if s["signal"]=="SELL"]
+    watch = [s for s in sigs if s["signal"]=="WATCH"]
+    skips = [s for s in sigs if s["signal"]=="SKIP"]
+    out   = ""
+    def score_bar(sc):
+        bars = ""
+        for i in range(7):
+            col = "#00c896" if i < sc else "#30363d"
+            bars += f'<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:{col};margin-right:2px;"></span>'
+        return f'<span title="{sc}/7">{bars}</span>'
+    def row(s, sig_label, sig_color):
+        rr_c = "#00c896" if s["rr"]>=2 else ("#f0b429" if s["rr"]>=1.5 else "#ff4d4d")
+        return (f'<tr>'
+                f'<td><b style="color:{sig_color};">{sig_label}</b></td>'
+                f'<td><b>{s["symbol"]}</b></td>'
+                f'<td>{score_bar(s["score"])} <span style="font-size:11px;color:#8b949e;">{s["score"]}/7</span></td>'
+                f'<td>&#8377;{s["entry"]}</td>'
+                f'<td style="color:#ff4d4d;">&#8377;{s["sl"]}</td>'
+                f'<td style="color:#58a6ff;">&#8377;{s["tp1"]}</td>'
+                f'<td style="color:#a78bfa;">&#8377;{s["tp2"]}</td>'
+                f'<td style="color:{rr_c};font-weight:700;">1:{s["rr"]}</td>'
+                f'<td style="color:#58a6ff;">{s["rsi"]}</td>'
+                f'<td style="color:#f0b429;">{s["adx"]}</td>'
+                f'<td style="font-size:11px;color:#8b949e;">{s["reason"][:60]}</td>'
+                f'</tr>')
+    for s in buys:  out += row(s, "&#9650; BUY",   "#00c896")
+    for s in sells: out += row(s, "&#9660; SELL",  "#ff4d4d")
+    for s in watch: out += row(s, "&#128064; WATCH","#f0b429")
+    for s in skips[:10]:
+        sc = s["score"]
+        out += (f'<tr style="opacity:0.35;">'
+                f'<td><b style="color:#8b949e;">&#8213; SKIP</b></td>'
+                f'<td>{s["symbol"]}</td>'
+                f'<td>{score_bar(sc)} <span style="font-size:11px;color:#8b949e;">{sc}/7</span></td>'
+                f'<td>&#8377;{s["entry"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td>'
+                f'<td style="color:#58a6ff;">{s["rsi"]}</td>'
+                f'<td style="color:#f0b429;">{s["adx"]}</td>'
+                f'<td style="font-size:11px;color:#8b949e;">{s["reason"][:60]}</td>'
+                f'</tr>')
+    if not out:
+        out = '<tr><td colspan="11" style="text-align:center;color:#8b949e;padding:20px;">No scan results — click &#9654; Pro Scan or wait for auto-scan every 5 min</td></tr>'
+    return out, len(buys), len(sells), len(watch), len(skips)
+
+def tbl_signals(sigs):
+    buys=[s for s in sigs if s["signal"]=="BUY"]
+    sells=[s for s in sigs if s["signal"]=="SELL"]
+    skips=[s for s in sigs if s["signal"]=="SKIP"]
+    out=""
+    for s in buys:
+        out+=f'<tr><td><b style="color:#00c896;">&#9650; BUY</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+    for s in sells:
+        out+=f'<tr><td><b style="color:#ff4d4d;">&#9660; SELL</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+    for s in skips[:15]:
+        out+=f'<tr style="opacity:0.4;"><td><b style="color:#8b949e;">&#8213; SKIP</b></td><td>{s["symbol"]}</td><td>&#8377;{s["entry"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+    if not out:
+        out='<tr><td colspan="7" style="text-align:center;color:#8b949e;padding:20px;">No scan results — click Scan Now or wait for auto-scan every 5 min</td></tr>'
+    return out,len(buys),len(sells),len(skips)
+
+def tbl_preopen(stocks):
+    if not stocks: return '<tr><td colspan="5" style="text-align:center;color:#8b949e;padding:20px;">No data</td></tr>'
+    out=""
+    for s in stocks:
+        p=float(s.get("pchange",0)); c="#00c896" if p>=0 else "#ff4d4d"; sg="+" if p>=0 else ""
+        try: vol=f"{int(s.get('volume',0)):,}"
+        except: vol="—"
+        out+=f'<tr><td><b>{s["symbol"]}</b></td><td>&#8377;{s.get("ltp",0)}</td><td style="color:{c};font-weight:700;">{sg}{p}%</td><td style="color:{c};">{"&#9650;" if p>=0 else "&#9660;"} &#8377;{abs(float(s.get("change",0)))}</td><td>{vol}</td></tr>'
+    return out
+
+def tbl_sectors(sectors):
+    if not sectors: return '<tr><td colspan="3" style="text-align:center;color:#8b949e;padding:20px;">No data</td></tr>'
+    mx=max((s["volume"] for s in sectors),default=1) or 1; out=""
+    for s in sectors:
+        p=float(s.get("pchange",0)); c="#00c896" if p>=0 else "#ff4d4d"; sg="+" if p>=0 else ""
+        bw=int(s["volume"]/mx*100)
+        try: vol=f"{int(s['volume']):,}"
+        except: vol="—"
+        out+=f'<tr><td><b>{s["name"]}</b></td><td><div style="background:#21262d;border-radius:4px;height:12px;width:140px;overflow:hidden;"><div style="background:#58a6ff;height:100%;width:{bw}%;"></div></div><span style="font-size:11px;color:#8b949e;">{vol}</span></td><td style="color:{c};font-weight:700;">{sg}{p}%</td></tr>'
+    return out
+
+def adv_dec_html(adv,dec,unc):
+    tot=adv+dec+unc or 1; aw=int(adv/tot*100); dw=int(dec/tot*100); uw=100-aw-dw
+    return (f'<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:16px;">'
+            f'<div class="sc"><div class="sl">&#9650; Advances</div><div class="sv" style="color:#00c896;">{adv}</div></div>'
+            f'<div class="sc"><div class="sl">&#9660; Declines</div><div class="sv" style="color:#ff4d4d;">{dec}</div></div>'
+            f'<div class="sc"><div class="sl">&#8213; Unchanged</div><div class="sv" style="color:#8b949e;">{unc}</div></div>'
+            f'<div style="flex:3;min-width:180px;"><div style="font-size:11px;color:#8b949e;margin-bottom:4px;">Nifty 50 Breadth</div>'
+            f'<div style="display:flex;border-radius:6px;overflow:hidden;height:18px;">'
+            f'<div style="width:{aw}%;background:#00c896;"></div>'
+            f'<div style="width:{uw}%;background:#8b949e;"></div>'
+            f'<div style="width:{dw}%;background:#ff4d4d;"></div></div>'
+            f'<div style="display:flex;gap:12px;font-size:11px;color:#8b949e;margin-top:3px;">'
+            f'<span style="color:#00c896;">&#9650;{aw}%</span><span>&#8213;{uw}%</span>'
+            f'<span style="color:#ff4d4d;">&#9660;{dw}%</span></div></div></div>')
 
 # ─────────────────────────────────────────────
 #  DASHBOARD
 # ─────────────────────────────────────────────
-@app.route("/dashboard", methods=["GET"])
+@app.route("/dashboard",methods=["GET"])
 def dashboard():
-    open_trades  = _state.get_open_trades()
-    closed_today = _state.get_closed_today()
-    history  = []
-    csv_path = "logs/trades.csv"
-    if os.path.exists(csv_path):
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                history.append(row)
+    today_str=datetime.now(IST).strftime("%Y-%m-%d")
+    mode_label="🧪 Paper" if PAPER_TRADING else "⚡ Live"
+    mkt_status="🟢 Open" if is_market_hours() else "🔴 Closed"
 
-    today_str    = datetime.now(IST).strftime("%Y-%m-%d")
-    today_closed = [r for r in history if r.get("date") == today_str]
+    h1=load_csv("logs/trades.csv"); t1=[r for r in h1 if r.get("date")==today_str]
+    h2=load_csv("logs/trades2.csv"); t2=[r for r in h2 if r.get("date")==today_str]
+    w1,l1,net1,gp1,gl1,wr1=stats(t1); w2,l2,net2,gp2,gl2,wr2=stats(t2)
 
-    total_trades = len(today_closed)
-    winners      = [r for r in today_closed if r.get("result") == "WIN"]
-    losers       = [r for r in today_closed if r.get("result") == "LOSS"]
-    # net_pnl uses net_pnl column if present, else pnl (backwards compat)
-    net_pnl      = round(sum(float(r.get("net_pnl", r["pnl"])) for r in today_closed), 2)
-    gross_profit = round(sum(float(r.get("gross_pnl", r["pnl"])) for r in winners), 2)
-    gross_loss   = round(abs(sum(float(r.get("gross_pnl", r["pnl"])) for r in losers)), 2)
-    win_rate     = round((len(winners) / total_trades * 100) if total_trades else 0, 1)
-    open_count   = len(open_trades)
-    mode_label   = "🧪 Paper Trading" if PAPER_TRADING else "⚡ Live Trading"
-    pnl_color    = "#00c896" if net_pnl >= 0 else "#ff4d4d"
-    mkt_status   = "🟢 Market Open" if is_market_hours() else "🔴 Market Closed"
+    nse=fetch_nse_data()
+    sig_rows,nb,ns,nsk=tbl_signals(_last_signals)
+    pro_rows,npb,nps,npw,npsk=tbl_pro_signals(_pro_signals)
+    def tbl_1350(sigs):
+        buys=[s for s in sigs if s["signal"]=="BUY"]
+        sells=[s for s in sigs if s["signal"]=="SELL"]
+        skips=[s for s in sigs if s["signal"]=="SKIP"]
+        out=""
+        for s in buys:
+            out+=f'<tr><td><b style="color:#00c896;">&#9650; BUY</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s.get("ad_ratio","")}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in sells:
+            out+=f'<tr><td><b style="color:#ff4d4d;">&#9660; SELL</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s.get("ad_ratio","")}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in skips[:10]:
+            out+=f'<tr style="opacity:0.35;"><td><b style="color:#8b949e;">&#8213; SKIP</b></td><td>{s["symbol"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        if not out: out='<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No results — click Scan or wait for auto-scan every 5min</td></tr>'
+        return out,len(buys),len(sells)
+    def tbl_gap(sigs):
+        buys=[s for s in sigs if s["signal"]=="BUY"]
+        sells=[s for s in sigs if s["signal"]=="SELL"]
+        skips=[s for s in sigs if s["signal"]=="SKIP"]
+        out=""
+        for s in buys:
+            out+=f'<tr><td><b style="color:#00c896;">&#9650; BUY</b></td><td><b>{s["symbol"]}</b></td><td style="color:#00c896;">+{s.get("gap_pct",0)}%</td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in sells:
+            out+=f'<tr><td><b style="color:#ff4d4d;">&#9660; SELL</b></td><td><b>{s["symbol"]}</b></td><td style="color:#ff4d4d;">{s.get("gap_pct",0)}%</td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in skips[:10]:
+            out+=f'<tr style="opacity:0.35;"><td><b style="color:#8b949e;">&#8213; SKIP</b></td><td>{s["symbol"]}</td><td>{s.get("gap_pct",0)}%</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        if not out: out='<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No results — click Scan or wait for auto-scan every 5min</td></tr>'
+        return out,len(buys),len(sells)
+    rows_1350,nb_1350,ns_1350=tbl_1350(_1350_signals)
+    rows_gap,nb_gap,ns_gap=tbl_gap(_gap_signals)
+    # ── Supertrend+ADX table ──
+    def tbl_st(sigs):
+        buys =[s for s in sigs if s["signal"]=="BUY"]
+        sells=[s for s in sigs if s["signal"]=="SELL"]
+        skips=[s for s in sigs if s["signal"]=="SKIP"]
+        out=""
+        for s in buys:
+            out+=f'<tr><td><b style="color:#00c896;">&#9650; BUY</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s["adx"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in sells:
+            out+=f'<tr><td><b style="color:#ff4d4d;">&#9660; SELL</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s["adx"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        for s in skips[:10]:
+            out+=f'<tr style="opacity:0.35;"><td><b style="color:#8b949e;">&#8213; SKIP</b></td><td>{s["symbol"]}</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td>&#8212;</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td></tr>'
+        if not out: out='<tr><td colspan="8" style="text-align:center;color:#8b949e;padding:20px;">No results — click Scan or wait for auto-scan every 5min</td></tr>'
+        return out,len(buys),len(sells)
+    rows_st,nb_st,ns_st=tbl_st(_st_signals)
+    # Signal rows with "Open Trade" button for each strategy
+    def _strat_btn(strat, s, bg):
+        sym=s["symbol"]; sig=s["signal"]; en=s["entry"]; sl=s["sl"]; tp=s["tp"]
+        return ('<button onclick="openStratTrade(\''+strat+'\',\''+sym+'\',\''+sig+'\','+str(en)+','+str(sl)+','+str(tp)+',this)"'
+                ' style="background:'+bg+';border:none;border-radius:5px;color:#fff;padding:3px 9px;font-size:11px;cursor:pointer;">&#9654; Open</button>')
+    def rows_with_btn_1350(sigs):
+        out=""
+        for s in sigs:
+            if s["signal"] not in ("BUY","SELL"): continue
+            sig_c="#00c896" if s["signal"]=="BUY" else "#ff4d4d"; sig_ico="&#9650;" if s["signal"]=="BUY" else "&#9660;"
+            btn=_strat_btn("1350",s,"#238636")
+            out+=f'<tr><td><b style="color:{sig_c};">{sig_ico} {s["signal"]}</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s.get("ad_ratio","")}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td><td>{btn}</td></tr>'
+        if not out: out='<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No signals — run a scan first</td></tr>'
+        return out
+    def rows_with_btn_gap(sigs):
+        out=""
+        for s in sigs:
+            if s["signal"] not in ("BUY","SELL"): continue
+            sig_c="#00c896" if s["signal"]=="BUY" else "#ff4d4d"; sig_ico="&#9650;" if s["signal"]=="BUY" else "&#9660;"
+            btn=_strat_btn("gap",s,"#1d4ed8")
+            out+=f'<tr><td><b style="color:{sig_c};">{sig_ico} {s["signal"]}</b></td><td><b>{s["symbol"]}</b></td><td>{s.get("gap_pct",0)}%</td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td><td>{btn}</td></tr>'
+        if not out: out='<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No signals — run a scan first</td></tr>'
+        return out
+    def rows_with_btn_st(sigs):
+        out=""
+        for s in sigs:
+            if s["signal"] not in ("BUY","SELL"): continue
+            sig_c="#00c896" if s["signal"]=="BUY" else "#ff4d4d"; sig_ico="&#9650;" if s["signal"]=="BUY" else "&#9660;"
+            btn=_strat_btn("st",s,"#b45309")
+            out+=f'<tr><td><b style="color:{sig_c};">{sig_ico} {s["signal"]}</b></td><td><b>{s["symbol"]}</b></td><td>&#8377;{s["entry"]}</td><td style="color:#ff4d4d;">&#8377;{s["sl"]}</td><td style="color:#00c896;">&#8377;{s["tp"]}</td><td>&#8377;{s["atr"]}</td><td style="color:#58a6ff;">{s["adx"]}</td><td style="font-size:11px;color:#8b949e;">{s["reason"]}</td><td>{btn}</td></tr>'
+        if not out: out='<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px;">No signals — run a scan first</td></tr>'
+        return out
+    rows_1350_trade=rows_with_btn_1350(_1350_signals)
+    rows_gap_trade=rows_with_btn_gap(_gap_signals)
+    rows_st_trade=rows_with_btn_st(_st_signals)
+    # Strategy open positions + stats
+    t1350,w1350,l1350,net1350,wr1350=strat_stats(_1350_closed)
+    tgap,wgap,lgap,netgap,wrgap=strat_stats(_gap_closed)
+    tst,wst,lst,netst,wrst=strat_stats(_st_closed)
+    pc1350="#00c896" if net1350>=0 else "#ff4d4d"
+    pcgap="#00c896" if netgap>=0 else "#ff4d4d"
+    pcst="#00c896" if netst>=0 else "#ff4d4d"
 
-    # ── daily P&L chart data (last 14 trading days) ──
-    from collections import defaultdict
-    day_pnl = defaultdict(float)
-    for r in history:
-        day_pnl[r["date"]] += float(r.get("net_pnl", r.get("pnl", 0)))
-    sorted_days  = sorted(day_pnl.keys())[-14:]
-    chart_labels = json.dumps(sorted_days)
-    chart_values = json.dumps([round(day_pnl[d], 2) for d in sorted_days])
-    chart_colors = json.dumps(["#00c896" if day_pnl[d] >= 0 else "#ff4d4d" for d in sorted_days])
+    nse_adv=nse.get("advances",0); nse_dec=nse.get("declines",0)
+    ad_ratio_now=round(nse_adv/max(nse_dec,1),2)
+    ad_bias_c="#00c896" if ad_ratio_now>=1.0 else "#ff4d4d"
+    ad_bias_lbl="BULLISH" if ad_ratio_now>=1.0 else "BEARISH"
+    pro_dir_c   = "#00c896" if _pro_nifty_dir=="UP" else ("#ff4d4d" if _pro_nifty_dir=="DOWN" else "#8b949e")
+    pro_dir_ico = "&#9650;" if _pro_nifty_dir=="UP" else ("&#9660;" if _pro_nifty_dir=="DOWN" else "&#8213;")
+    pc1="#00c896" if net1>=0 else "#ff4d4d"; pc2="#00c896" if net2>=0 else "#ff4d4d"
+    nifty_c="#00c896" if nse.get("nifty_chg",0)>=0 else "#ff4d4d"
+    nifty_sg="+" if nse.get("nifty_chg",0)>=0 else ""
 
-    # ── open positions table rows ──
-    open_rows = ""
-    for sym, t in open_trades.items():
-        tp_hit     = t.get("tp_hit", False)
-        trail_tp   = t.get("trail_tp")
-        atr_val    = t.get("atr_val", "—")
-        # Show trailing TP if activated, else first TP target
-        tp_display = f"₹{trail_tp} 🔄" if tp_hit and trail_tp else f"₹{t['tp']}"
-        tp_class   = "text-info" if tp_hit else "text-success"
-        open_rows += f"""
-        <tr id="row-{sym}">
-          <td><b>{sym}</b></td>
-          <td>₹{t['entry']}</td>
-          <td>{t['qty']}</td>
-          <td class="text-danger" title="ATR({ATR_PERIOD})×{ATR_MULT} = ₹{atr_val}">₹{t['sl']}</td>
-          <td class="{tp_class}">{tp_display}</td>
-          <td>₹{t['capital_used']}</td>
-          <td id="ltp-{sym}"><span class="text-muted">fetching…</span></td>
-          <td id="upnl-{sym}"><span class="text-muted">—</span></td>
-          <td>{t['entry_time']}</td>
-          <td>
-            <button class="btn btn-sm btn-outline-danger close-btn" data-sym="{sym}"
-              onclick="closePosition('{sym}',this)">Close</button>
-          </td>
-        </tr>"""
-    if not open_rows:
-        open_rows = '<tr><td colspan="10" class="text-center text-muted">No open positions</td></tr>'
+    CSS="""
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',Arial,sans-serif;font-size:14px;}
+.topbar{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;}
+.bot-title{font-size:1.1rem;font-weight:700;color:#58a6ff;}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;background:#21262d;color:#8b949e;border:1px solid #30363d;margin-left:6px;}
+.tr{text-align:right;font-size:12px;color:#8b949e;}
+.con{padding:20px;}
+.mt{display:flex;gap:0;border-bottom:2px solid #30363d;margin-bottom:20px;}
+.mtb{background:none;border:none;border-bottom:3px solid transparent;color:#8b949e;padding:12px 22px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s;white-space:nowrap;}
+.mtb:hover{color:#c9d1d9;} .mtb.active{color:#58a6ff;border-bottom-color:#58a6ff;}
+.mtp{display:none;} .mtp.active{display:block;}
+.stabs{display:flex;gap:8px;margin-bottom:18px;}
+.sb{background:#161b22;border:2px solid #30363d;border-radius:10px;color:#8b949e;padding:10px 20px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s;}
+.sb:hover{border-color:#58a6ff;color:#c9d1d9;} .sb.active{border-color:#58a6ff;color:#58a6ff;background:#1c2128;}
+.sp{display:none;} .sp.active{display:block;}
+.sg{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:14px;}
+.pg{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px;}
+.sc{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px 10px;text-align:center;}
+.sl{font-size:11px;color:#8b949e;margin-bottom:5px;} .sv{font-size:1.6rem;font-weight:700;}
+.tabs{display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:14px;}
+.tb{background:none;border:none;border-bottom:3px solid transparent;color:#8b949e;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s;white-space:nowrap;}
+.tb:hover{color:#c9d1d9;} .tb.active{color:#58a6ff;border-bottom-color:#58a6ff;}
+.tp{display:none;} .tp.active{display:block;}
+.tw{background:#161b22;border:1px solid #30363d;border-radius:10px;overflow:hidden;overflow-x:auto;}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{background:#21262d;color:#8b949e;font-weight:500;padding:9px 13px;text-align:left;border-bottom:1px solid #30363d;white-space:nowrap;}
+td{padding:9px 13px;border-bottom:1px solid #21262d;vertical-align:middle;white-space:nowrap;}
+tr:last-child td{border-bottom:none;} tr:hover td{background:#1c2128;}
+.ib{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px 13px;margin-bottom:14px;font-size:12px;color:#8b949e;display:flex;gap:18px;flex-wrap:wrap;}
+.ib span{color:#c9d1d9;font-weight:600;}
+.scanbar{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-bottom:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.scanbtn{background:#238636;border:none;border-radius:6px;color:#fff;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;}
+.scanbtn:hover{background:#2ea043;}
+.ng{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+.nt{font-size:12px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin:16px 0 8px;}
+.nifty-bar{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;}
+.ltp-status{font-size:11px;color:#8b949e;margin-bottom:10px;}
+@media(max-width:700px){{.sg{{grid-template-columns:repeat(3,1fr);}}.ng{{grid-template-columns:1fr;}}}}
+"""
 
-    # ── today closed rows ──
-    closed_rows = ""
-    for r in reversed(today_closed):
-        gross_val   = float(r.get("gross_pnl", r["pnl"]))
-        charges_val = float(r.get("charges", 0))
-        net_val     = float(r.get("net_pnl", r["pnl"]))
-        badge       = 'success' if net_val >= 0 else 'danger'
-        gross_sign  = "+" if gross_val >= 0 else ""
-        net_sign    = "+" if net_val >= 0 else ""
-        closed_rows += f"""
-        <tr>
-          <td><b>{r['symbol']}</b></td>
-          <td>₹{r['entry']}</td>
-          <td>₹{r['exit']}</td>
-          <td>{r['qty']}</td>
-          <td>{gross_sign}₹{gross_val}</td>
-          <td class="text-warning">-₹{charges_val}</td>
-          <td><span class="badge bg-{badge}">{net_sign}₹{net_val}</span></td>
-          <td>{r['reason']}</td>
-          <td>{r['exit_time']}</td>
-        </tr>"""
-    if not closed_rows:
-        closed_rows = '<tr><td colspan="9" class="text-center text-muted">No closed trades today</td></tr>'
-
-    # ── full history rows (all trades, paginated client-side) ──
-    history_rows = ""
-    for r in reversed(history):
-        gross_val   = float(r.get("gross_pnl", r["pnl"]))
-        charges_val = float(r.get("charges", 0))
-        net_val     = float(r.get("net_pnl", r["pnl"]))
-        badge       = 'success' if net_val >= 0 else 'danger'
-        gross_sign  = "+" if gross_val >= 0 else ""
-        net_sign    = "+" if net_val >= 0 else ""
-        history_rows += f"""
-        <tr class="hist-row" data-date="{r['date']}" data-sym="{r['symbol'].upper()}">
-          <td>{r['date']}</td>
-          <td><b>{r['symbol']}</b></td>
-          <td>₹{r['entry']}</td>
-          <td>₹{r['exit']}</td>
-          <td>{r['qty']}</td>
-          <td>{gross_sign}₹{gross_val}</td>
-          <td class="text-warning">-₹{charges_val}</td>
-          <td><span class="badge bg-{badge}">{net_sign}₹{net_val}</span></td>
-          <td>{r.get('reason','')}</td>
-        </tr>"""
-    if not history_rows:
-        history_rows = '<tr class="hist-row"><td colspan="9" class="text-center text-muted">No trade history yet</td></tr>'
-
-    total_hist = len(history)
-
-    html = f"""<!DOCTYPE html>
+    html=f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Chartink Bot Dashboard</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"/>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <style>
-    body        {{ background:#0d1117; color:#c9d1d9; font-family:'Segoe UI',sans-serif; }}
-    .card       {{ background:#161b22; border:1px solid #30363d; border-radius:12px; }}
-    .stat-val   {{ font-size:2rem; font-weight:700; }}
-    th          {{ color:#8b949e; font-weight:500; border-color:#30363d !important; }}
-    td          {{ border-color:#30363d !important; vertical-align:middle; }}
-    .badge      {{ font-size:.8rem; padding:.4em .7em; }}
-    .nav-tabs .nav-link        {{ color:#8b949e; border-color:#30363d; }}
-    .nav-tabs .nav-link.active {{ color:#fff; background:#161b22; border-bottom-color:#161b22; }}
-    .top-bar    {{ background:#161b22; border-bottom:1px solid #30363d; padding:12px 20px; }}
-    .refresh-note {{ font-size:.75rem; color:#8b949e; }}
-    input.form-control {{ background:#0d1117; border-color:#30363d; color:#c9d1d9; }}
-    input.form-control:focus {{ background:#0d1117; border-color:#58a6ff; color:#c9d1d9; box-shadow:none; }}
-    .page-btn   {{ cursor:pointer; padding:2px 10px; border-radius:4px; border:1px solid #30363d;
-                   background:#161b22; color:#c9d1d9; font-size:.8rem; }}
-    .page-btn.active {{ background:#58a6ff; color:#000; border-color:#58a6ff; }}
-    .close-btn  {{ padding:2px 10px; font-size:.75rem; }}
-  </style>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Chartink Bot Dashboard</title>
+<style>{CSS}</style>
 </head>
 <body>
-<div class="top-bar d-flex justify-content-between align-items-center flex-wrap gap-2">
-  <div>
-    <span style="font-size:1.2rem;font-weight:700;color:#58a6ff;">📊 Chartink Bot</span>
-    <span class="ms-3 badge bg-secondary">{mode_label}</span>
-    <span class="ms-2 badge bg-dark border">{mkt_status}</span>
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+    <span class="bot-title">&#128202; Chartink Bot</span>
+    <span class="badge">{mode_label}</span>
+    <span class="badge">{mkt_status}</span>
+    <span class="badge" style="color:{nifty_c};">Nifty &#8377;{nse.get('nifty_ltp',0)} {nifty_sg}{nse.get('nifty_chg',0)}%</span>
   </div>
-  <div class="text-end">
-    <div style="color:#c9d1d9;">🕐 {time_str()}</div>
-    <div class="refresh-note" id="ltp-status">⟳ Fetching live prices…</div>
+  <div class="tr"><div>&#128336; {time_str()}</div><div id="ltp-ts" class="ltp-status">&#8635; Fetching live prices...</div></div>
+</div>
+<div class="con">
+<div class="mt">
+  <button class="mtb active" onclick="showMain('trading',this)">&#127939; Trading Bots</button>
+  <button class="mtb" onclick="showMain('signals',this)">&#128200; Strategies <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{nb_1350+nb_gap+nb_st}B {ns_1350+ns_gap+ns_st}S</span></button>
+  <button class="mtb" onclick="showMain('nse',this)">&#128200; NSE Market</button>
+  <button class="mtb" onclick="showMain('pro',this)">&#127919; Pro Engine <span style="background:#9333ea;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:4px;">{npb}B {nps}S</span></button>
+</div>
+
+<!-- TRADING BOTS -->
+<div id="main-trading" class="mtp active">
+  <div class="stabs">
+    <button class="sb active" onclick="showS('s1',this)">&#128209; tazbul | Open:{len(open_trades)} | P&amp;L:&#8377;{net1}</button>
+    <button class="sb" onclick="showS('s2',this)">&#128209; TazAmol-Test1 | Open:{len(open_trades2)} | P&amp;L:&#8377;{net2}</button>
+  </div>
+  <div id="s1" class="sp active">
+    <div class="ib">Screener:<span>tazbul</span> SL:<span>{SL_PERCENT}%</span> TP:<span>{TP_PERCENT}%</span> Capital:<span>&#8377;{CAPITAL_PER_TRADE}</span> Webhook:<span>/alert</span></div>
+    <div class="sg">
+      <div class="sc"><div class="sl">Open</div><div class="sv" style="color:#f0b429;">{len(open_trades)}</div></div>
+      <div class="sc"><div class="sl">Today</div><div class="sv" style="color:#58a6ff;">{len(t1)}</div></div>
+      <div class="sc"><div class="sl">Winners</div><div class="sv" style="color:#00c896;">{len(w1)}</div></div>
+      <div class="sc"><div class="sl">Losers</div><div class="sv" style="color:#ff4d4d;">{len(l1)}</div></div>
+      <div class="sc"><div class="sl">Win Rate</div><div class="sv" style="color:#a78bfa;">{wr1}%</div></div>
+      <div class="sc"><div class="sl">Net P&amp;L</div><div class="sv" style="color:{pc1};">&#8377;{net1}</div></div>
+    </div>
+    <div class="pg">
+      <div class="sc"><div class="sl">Gross Profit</div><div class="sv" style="color:#00c896;">&#8377;{gp1}</div></div>
+      <div class="sc"><div class="sl">Gross Loss</div><div class="sv" style="color:#ff4d4d;">&#8377;{gl1}</div></div>
+      <div class="sc"><div class="sl">Capital/Trade</div><div class="sv" style="color:#58a6ff;">&#8377;{CAPITAL_PER_TRADE}</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tb active" onclick="showT('s1','open',this)">Open ({len(open_trades)})</button>
+      <button class="tb" onclick="showT('s1','closed',this)">Today ({len(t1)})</button>
+      <button class="tb" onclick="showT('s1','hist',this)">History</button>
+    </div>
+    <div id="s1-open" class="tp active"><div class="tw"><table>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>ATR SL &#128208;</th><th>TP / Trail &#128200;</th><th>Capital</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody id="open-tbody-1">{tbl_open(open_trades,"1")}</tbody></table></div></div>
+    <div id="s1-closed" class="tp"><div class="tw"><table>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Gross P&amp;L</th><th>Charges &#127968;</th><th>Net P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
+      <tbody>{tbl_closed(t1)}</tbody></table></div></div>
+    <div id="s1-hist" class="tp"><div class="tw"><table>
+      <thead><tr><th>Date</th><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Gross P&amp;L</th><th>Charges &#127968;</th><th>Net P&amp;L</th><th>Reason</th></tr></thead>
+      <tbody>{tbl_hist(h1)}</tbody></table></div></div>
+  </div>
+  <div id="s2" class="sp">
+    <div class="ib">Screener:<span>TazAmol-Test1</span> SL:<span>{BOT2_SL}%</span> TP:<span>{BOT2_TP}%</span> Capital:<span>&#8377;{BOT2_CAPITAL}</span> Webhook:<span>/alert2</span></div>
+    <div class="sg">
+      <div class="sc"><div class="sl">Open</div><div class="sv" style="color:#f0b429;">{len(open_trades2)}</div></div>
+      <div class="sc"><div class="sl">Today</div><div class="sv" style="color:#58a6ff;">{len(t2)}</div></div>
+      <div class="sc"><div class="sl">Winners</div><div class="sv" style="color:#00c896;">{len(w2)}</div></div>
+      <div class="sc"><div class="sl">Losers</div><div class="sv" style="color:#ff4d4d;">{len(l2)}</div></div>
+      <div class="sc"><div class="sl">Win Rate</div><div class="sv" style="color:#a78bfa;">{wr2}%</div></div>
+      <div class="sc"><div class="sl">Net P&amp;L</div><div class="sv" style="color:{pc2};">&#8377;{net2}</div></div>
+    </div>
+    <div class="pg">
+      <div class="sc"><div class="sl">Gross Profit</div><div class="sv" style="color:#00c896;">&#8377;{gp2}</div></div>
+      <div class="sc"><div class="sl">Gross Loss</div><div class="sv" style="color:#ff4d4d;">&#8377;{gl2}</div></div>
+      <div class="sc"><div class="sl">Capital/Trade</div><div class="sv" style="color:#58a6ff;">&#8377;{BOT2_CAPITAL}</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tb active" onclick="showT('s2','open',this)">Open ({len(open_trades2)})</button>
+      <button class="tb" onclick="showT('s2','closed',this)">Today ({len(t2)})</button>
+      <button class="tb" onclick="showT('s2','hist',this)">History</button>
+    </div>
+    <div id="s2-open" class="tp active"><div class="tw"><table>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Qty</th><th>ATR SL &#128208;</th><th>TP / Trail &#128200;</th><th>Capital</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody id="open-tbody-2">{tbl_open(open_trades2,"2")}</tbody></table></div></div>
+    <div id="s2-closed" class="tp"><div class="tw"><table>
+      <thead><tr><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Gross P&amp;L</th><th>Charges &#127968;</th><th>Net P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
+      <tbody>{tbl_closed(t2)}</tbody></table></div></div>
+    <div id="s2-hist" class="tp"><div class="tw"><table>
+      <thead><tr><th>Date</th><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Gross P&amp;L</th><th>Charges &#127968;</th><th>Net P&amp;L</th><th>Reason</th></tr></thead>
+      <tbody>{tbl_hist(h2)}</tbody></table></div></div>
   </div>
 </div>
 
-<div class="container-fluid py-4 px-3 px-md-4">
-
-  {{# ── Stat cards ── #}}
-  <div class="row g-3 mb-4">
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Open Positions</div><div class="stat-val text-warning">{open_count}</div></div></div>
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Trades Today</div><div class="stat-val text-info">{total_trades}</div></div></div>
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Winners</div><div class="stat-val text-success">{len(winners)}</div></div></div>
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Losers</div><div class="stat-val text-danger">{len(losers)}</div></div></div>
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Win Rate</div><div class="stat-val" style="color:#a78bfa;">{win_rate}%</div></div></div>
-    <div class="col-6 col-md-2"><div class="card p-3 text-center"><div class="text-muted small">Net P&L</div><div class="stat-val" style="color:{pnl_color};">₹{net_pnl}</div></div></div>
+<!-- STRATEGIES -->
+<div id="main-signals" class="mtp">
+  <div class="ib" style="margin-bottom:12px;">
+    Market Bias:<span style="color:{ad_bias_c};font-weight:700;">{ad_bias_lbl}</span>
+    A/D Ratio:<span style="color:{ad_bias_c};">{nse_adv}/{nse_dec} ({ad_ratio_now})</span>
+    Nifty:<span style="color:{nifty_c};">{nse.get('nifty_ltp',0)} {nifty_sg}{nse.get('nifty_chg',0)}%</span>
+    Auto:<span>Every 5min</span>
   </div>
-  <div class="row g-3 mb-4">
-    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Gross Profit</div><div class="stat-val text-success">₹{gross_profit}</div></div></div>
-    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Gross Loss</div><div class="stat-val text-danger">₹{gross_loss}</div></div></div>
-    <div class="col-md-4"><div class="card p-3 text-center"><div class="text-muted small">Capital / Trade</div><div class="stat-val text-info">₹{CAPITAL_PER_TRADE}</div></div></div>
+  <div class="tabs" style="margin-bottom:14px;">
+    <button class="tb active" onclick="showStratTab('s1350',this)">&#128200; 13/50
+      <span style="background:#238636;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">{nb_1350}B {ns_1350}S</span>
+    </button>
+    <button class="tb" onclick="showStratTab('sgap',this)">&#128208; Gap D/U
+      <span style="background:#1d4ed8;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">{nb_gap}B {ns_gap}S</span>
+    </button>
+    <button class="tb" onclick="showStratTab('sst',this)">&#128312; ST+ADX
+      <span style="background:#b45309;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px;">{nb_st}B {ns_st}S</span>
+    </button>
+  </div>
+  <div id="s1350" class="tp active">
+    <div class="scanbar">
+      <button class="scanbtn" onclick="doScan1350(this)">&#9654; Scan 13/50</button>
+      <span style="font-size:13px;">Last: <b>{_1350_scan_time}</b></span>
+      <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{nb_1350}</b></span>
+      <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{ns_1350}</b></span>
+    </div>
+    <div class="ib">Strategy:<span>EMA 13/50 Crossover</span> Filter:<span>A/D Market Bias</span> SL:<span>ATR&#215;{ATR_SL_MULT}</span> TP:<span>ATR&#215;{ATR_TP_MULT}</span> TF:<span>5-min</span></div>
+    <div class="sg">
+      <div class="sc"><div class="sl">Open</div><div class="sv" style="color:#f0b429;">{len(_1350_open)}</div></div>
+      <div class="sc"><div class="sl">Today</div><div class="sv" style="color:#58a6ff;">{len(t1350)}</div></div>
+      <div class="sc"><div class="sl">Winners</div><div class="sv" style="color:#00c896;">{len(w1350)}</div></div>
+      <div class="sc"><div class="sl">Losers</div><div class="sv" style="color:#ff4d4d;">{len(l1350)}</div></div>
+      <div class="sc"><div class="sl">Win Rate</div><div class="sv" style="color:#a78bfa;">{wr1350}%</div></div>
+      <div class="sc"><div class="sl">Net P&amp;L</div><div class="sv" style="color:{pc1350};">&#8377;{net1350}</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tb active" onclick="showT('s1350','open',this)">Open ({len(_1350_open)})</button>
+      <button class="tb" onclick="showT('s1350','signals',this)">Signals ({nb_1350}B {ns_1350}S)</button>
+      <button class="tb" onclick="showT('s1350','closed',this)">Today ({len(t1350)})</button>
+    </div>
+    <div id="s1350-open" class="tp active"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Qty</th><th>SL &#8377;</th><th>TP &#8377;</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody>{tbl_open_strat(_1350_open,"1350")}</tbody></table></div></div>
+    <div id="s1350-signals" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Symbol</th><th>Entry &#8377;</th><th>SL &#8377;</th><th>TP &#8377;</th><th>ATR</th><th>A/D</th><th>Reason</th><th>Trade</th></tr></thead>
+      <tbody>{rows_1350_trade}</tbody>
+    </table></div></div>
+    <div id="s1350-closed" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Exit &#8377;</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
+      <tbody>{tbl_strat_closed(t1350)}</tbody></table></div></div>
   </div>
 
-  {{# ── Daily P&L Chart ── #}}
-  <div class="card p-3 mb-4">
-    <div class="text-muted small mb-2">📈 Daily Net P&L — Last 14 Trading Days</div>
-    <canvas id="pnlChart" height="80"></canvas>
+  <div id="sgap" class="tp">
+    <div class="scanbar">
+      <button class="scanbtn" style="background:#1d4ed8;" onclick="doScanGap(this)">&#9654; Scan Gap D/U</button>
+      <span style="font-size:13px;">Last: <b>{_gap_scan_time}</b></span>
+      <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{nb_gap}</b></span>
+      <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{ns_gap}</b></span>
+    </div>
+    <div class="ib">Strategy:<span>Gap Up/Down + 1st 5min Candle</span> EMA:<span>13/50 Alignment</span> SL:<span>Candle Low/High + ATR</span> TP:<span>ATR&#215;{ATR_TP_MULT}</span> Min Gap:<span>{GAP_MIN_PCT}%</span></div>
+    <div class="sg">
+      <div class="sc"><div class="sl">Open</div><div class="sv" style="color:#f0b429;">{len(_gap_open)}</div></div>
+      <div class="sc"><div class="sl">Today</div><div class="sv" style="color:#58a6ff;">{len(tgap)}</div></div>
+      <div class="sc"><div class="sl">Winners</div><div class="sv" style="color:#00c896;">{len(wgap)}</div></div>
+      <div class="sc"><div class="sl">Losers</div><div class="sv" style="color:#ff4d4d;">{len(lgap)}</div></div>
+      <div class="sc"><div class="sl">Win Rate</div><div class="sv" style="color:#a78bfa;">{wrgap}%</div></div>
+      <div class="sc"><div class="sl">Net P&amp;L</div><div class="sv" style="color:{pcgap};">&#8377;{netgap}</div></div>
+    </div>
+    <div class="tabs">
+      <button class="tb active" onclick="showT('sgap','open',this)">Open ({len(_gap_open)})</button>
+      <button class="tb" onclick="showT('sgap','signals',this)">Signals ({nb_gap}B {ns_gap}S)</button>
+      <button class="tb" onclick="showT('sgap','closed',this)">Today ({len(tgap)})</button>
+    </div>
+    <div id="sgap-open" class="tp active"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Qty</th><th>SL &#8377;</th><th>TP &#8377;</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody>{tbl_open_strat(_gap_open,"gap")}</tbody></table></div></div>
+    <div id="sgap-signals" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Symbol</th><th>Gap%</th><th>Entry &#8377;</th><th>SL &#8377;</th><th>TP &#8377;</th><th>ATR</th><th>Reason</th><th>Trade</th></tr></thead>
+      <tbody>{rows_gap_trade}</tbody>
+    </table></div></div>
+    <div id="sgap-closed" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Exit &#8377;</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
+      <tbody>{tbl_strat_closed(tgap)}</tbody></table></div></div>
   </div>
 
-  {{# ── Tabs ── #}}
-  <ul class="nav nav-tabs" id="dashTabs">
-    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-open">🟡 Open Positions <span class="badge bg-warning text-dark ms-1">{open_count}</span></button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-closed">📋 Today's Trades <span class="badge bg-secondary ms-1">{total_trades}</span></button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-history">📁 Full History <span class="badge bg-secondary ms-1">{total_hist}</span></button></li>
-  </ul>
-
-  <div class="tab-content mt-3">
-
-    {{# ── Tab 1: Open Positions ── #}}
-    <div class="tab-pane fade show active" id="tab-open">
-      <div class="card"><div class="table-responsive">
-        <table class="table table-dark table-hover mb-0">
-         <thead><tr>
-           <th>Stock</th><th>Entry</th><th>Qty</th>
-           <th title="ATR(21)×3 trailing stop">ATR SL 📐</th>
-           <th title="First TP 0.05% → then trailing">TP / Trail 📈</th>
-           <th>Capital</th>
-           <th>Live Price</th><th>Unrealised P&L</th>
-           <th>Entry Time</th><th>Action</th>
-         </tr></thead>
-          <tbody id="open-tbody">{open_rows}</tbody>
-        </table>
-      </div></div>
+  <!-- SUPERTREND+ADX TAB -->
+  <div id="sst" class="tp">
+    <div class="scanbar" style="background:#1a1000;border-color:#b45309;">
+      <button class="scanbtn" style="background:#b45309;" onclick="doScanST(this)">&#9654; Scan ST+ADX</button>
+      <span style="font-size:13px;">Last: <b>{_st_scan_time}</b></span>
+      <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{nb_st}</b></span>
+      <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{ns_st}</b></span>
     </div>
-
-    {{# ── Tab 2: Today Closed ── #}}
-    <div class="tab-pane fade" id="tab-closed">
-      <div class="card"><div class="table-responsive">
-        <table class="table table-dark table-hover mb-0">
-          <thead><tr>
-            <th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th>
-            <th>Gross P&L</th>
-            <th title="Dhan intraday charges">Charges 🏦</th>
-            <th>Net P&L</th>
-            <th>Reason</th><th>Exit Time</th>
-          </tr></thead>
-          <tbody>{closed_rows}</tbody>
-        </table>
-      </div></div>
+    <div class="ib" style="background:#1a1000;border-color:#b45309;">
+      Strategy:<span>Supertrend Flip</span>
+      Filter:<span>ADX &#8805; {ST_ADX_MIN}</span>
+      Period:<span>{ST_PERIOD}</span>
+      Mult:<span>{ST_MULTIPLIER}</span>
+      SL:<span>ATR&#215;{ST_ATR_SL}</span>
+      TP:<span>ATR&#215;{ST_ATR_TP}</span>
+      TF:<span style="color:#f0b429;font-weight:700;">1-min &#128312;</span>
     </div>
-
-    {{# ── Tab 3: Full History ── #}}
-    <div class="tab-pane fade" id="tab-history">
-      <div class="row g-2 mb-3">
-        <div class="col-sm-4">
-          <input type="date" id="filter-date" class="form-control form-control-sm"
-            placeholder="Filter by date" oninput="applyFilters()"/>
-        </div>
-        <div class="col-sm-4">
-          <input type="text" id="filter-sym" class="form-control form-control-sm"
-            placeholder="Search stock symbol…" oninput="applyFilters()"/>
-        </div>
-        <div class="col-sm-4 d-flex align-items-center">
-          <span class="text-muted small" id="hist-count">Showing {total_hist} of {total_hist} trades</span>
-        </div>
-      </div>
-      <div class="card"><div class="table-responsive">
-        <table class="table table-dark table-hover mb-0" id="hist-table">
-          <thead><tr>
-            <th>Date</th><th>Stock</th><th>Entry</th><th>Exit</th><th>Qty</th>
-            <th>Gross P&L</th>
-            <th title="Dhan intraday charges">Charges 🏦</th>
-            <th>Net P&L</th>
-            <th>Reason</th>
-          </tr></thead>
-          <tbody id="hist-tbody">{history_rows}</tbody>
-        </table>
-      </div></div>
-      <div class="d-flex gap-2 mt-3 flex-wrap align-items-center" id="pagination"></div>
+    <div class="sg">
+      <div class="sc"><div class="sl">Open</div><div class="sv" style="color:#f0b429;">{len(_st_open)}</div></div>
+      <div class="sc"><div class="sl">Today</div><div class="sv" style="color:#58a6ff;">{len(tst)}</div></div>
+      <div class="sc"><div class="sl">Winners</div><div class="sv" style="color:#00c896;">{len(wst)}</div></div>
+      <div class="sc"><div class="sl">Losers</div><div class="sv" style="color:#ff4d4d;">{len(lst)}</div></div>
+      <div class="sc"><div class="sl">Win Rate</div><div class="sv" style="color:#a78bfa;">{wrst}%</div></div>
+      <div class="sc"><div class="sl">Net P&amp;L</div><div class="sv" style="color:{pcst};">&#8377;{netst}</div></div>
     </div>
-
+    <div class="tabs">
+      <button class="tb active" onclick="showT('sst','open',this)">Open ({len(_st_open)})</button>
+      <button class="tb" onclick="showT('sst','signals',this)">Signals ({nb_st}B {ns_st}S)</button>
+      <button class="tb" onclick="showT('sst','closed',this)">Today ({len(tst)})</button>
+    </div>
+    <div id="sst-open" class="tp active"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Qty</th><th>SL &#8377;</th><th>TP &#8377;</th><th>Live Price</th><th>Unreal P&amp;L</th><th>Time</th><th>Action</th></tr></thead>
+      <tbody>{tbl_open_strat(_st_open,"st")}</tbody></table></div></div>
+    <div id="sst-signals" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Symbol</th><th>Entry &#8377;</th><th>SL &#8377;</th><th>TP &#8377;</th><th>ATR</th><th>ADX</th><th>Reason</th><th>Trade</th></tr></thead>
+      <tbody>{rows_st_trade}</tbody>
+    </table></div></div>
+    <div id="sst-closed" class="tp"><div class="tw"><table>
+      <thead><tr><th>Signal</th><th>Stock</th><th>Entry &#8377;</th><th>Exit &#8377;</th><th>Qty</th><th>P&amp;L</th><th>Reason</th><th>Time</th></tr></thead>
+      <tbody>{tbl_strat_closed(tst)}</tbody></table></div></div>
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<!-- NSE MARKET -->
+<div id="main-nse" class="mtp">
+  <div class="nifty-bar">
+    <span style="font-size:13px;font-weight:700;">&#128200; Nifty 50</span>
+    <span style="font-size:1.4rem;font-weight:700;">&#8377;{nse.get('nifty_ltp',0)}</span>
+    <span style="font-size:1rem;font-weight:700;color:{nifty_c};">{nifty_sg}{nse.get('nifty_chg',0)}%</span>
+    <span style="font-size:12px;color:#8b949e;">Yahoo Finance | {nse.get('fetched_at','')}</span>
+  </div>
+  {"<div style='background:#2d1a1a;border:1px solid #6e2020;border-radius:8px;padding:8px 13px;margin-bottom:10px;font-size:12px;color:#ff4d4d;'>&#9888; "+nse.get('error','')+"</div>" if nse.get('error') else ""}
+  <div class="nt">&#128200; Market Breadth</div>
+  {adv_dec_html(nse.get('advances',0),nse.get('declines',0),nse.get('unchanged',0))}
+  <div class="ng">
+    <div>
+      <div class="nt">&#9728; Nifty 50 — Top Movers</div>
+      <div class="tw"><table>
+        <thead><tr><th>Symbol</th><th>LTP &#8377;</th><th>Change %</th><th>Change &#8377;</th><th>Volume</th></tr></thead>
+        <tbody>{tbl_preopen(nse.get('preopen',[]))}</tbody>
+      </table></div>
+    </div>
+    <div>
+      <div class="nt">&#127970; Sector Performance</div>
+      <div class="tw"><table>
+        <thead><tr><th>Sector</th><th>Volume</th><th>Change %</th></tr></thead>
+        <tbody>{tbl_sectors(nse.get('sectors',[]))}</tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
+
+<!-- PRO ENGINE -->
+<div id="main-pro" class="mtp">
+  <div class="scanbar" style="background:#1a1025;border-color:#6d28d9;">
+    <button class="scanbtn" style="background:#7c3aed;" onclick="doProScan(this)">&#9654; Pro Scan</button>
+    <span style="font-size:13px;">Last: <b>{_pro_scan_time}</b></span>
+    <span style="font-size:13px;">Nifty: <b style="color:{pro_dir_c};">{pro_dir_ico} {_pro_nifty_dir}</b></span>
+    <span style="font-size:13px;">&#9650; BUY:<b style="color:#00c896;">{npb}</b></span>
+    <span style="font-size:13px;">&#9660; SELL:<b style="color:#ff4d4d;">{nps}</b></span>
+    <span style="font-size:13px;">&#128064; Watch:<b style="color:#f0b429;">{npw}</b></span>
+    <span style="font-size:13px;">&#8213; Skip:<b style="color:#8b949e;">{npsk}</b></span>
+  </div>
+  <div class="ib" style="background:#1a1025;border-color:#6d28d9;">
+    Strategy:<span style="color:#a78bfa;">7-Filter Confluence</span>
+    Universe:<span>Nifty 50</span>
+    TF:<span>5-min</span>
+    Filters:<span>EMA&#43;ADX&#43;RSI&#43;Volume&#43;Candle&#43;Nifty&#43;RR</span>
+    ADX:<span>&gt;{PRO_ADX_MIN}</span>
+    RSI BUY:<span>{PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI}</span>
+    Vol:<span>{PRO_VOL_MULT}x avg</span>
+    SL:<span>ATR&#215;{PRO_ATR_SL}</span>
+    TP1:<span>ATR&#215;{PRO_ATR_TP1}</span>
+    TP2:<span>ATR&#215;{PRO_ATR_TP2}</span>
+    Window:<span>9:30-14:30</span>
+    Auto:<span>Every 5min</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:18px;">
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F1</b> <span style="color:#c9d1d9;">EMA Trend</span><br/><span style="color:#8b949e;">EMA13 aligned with EMA50</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F2</b> <span style="color:#c9d1d9;">EMA Crossover</span><br/><span style="color:#8b949e;">Fresh cross this candle</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F3</b> <span style="color:#c9d1d9;">ADX &gt; {PRO_ADX_MIN}</span><br/><span style="color:#8b949e;">Strong trend, not sideways</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F4</b> <span style="color:#c9d1d9;">RSI {PRO_RSI_BUY_LO}-{PRO_RSI_BUY_HI}</span><br/><span style="color:#8b949e;">Momentum not overbought</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F5</b> <span style="color:#c9d1d9;">Volume {PRO_VOL_MULT}x avg</span><br/><span style="color:#8b949e;">Big player confirmation</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F6</b> <span style="color:#c9d1d9;">Nifty Aligned</span><br/><span style="color:#8b949e;">Market direction match</span>
+    </div>
+    <div style="background:#1a1025;border:1px solid #6d28d9;border-radius:8px;padding:9px 12px;font-size:12px;">
+      <b style="color:#a78bfa;">F7</b> <span style="color:#c9d1d9;">Candle Quality</span><br/><span style="color:#8b949e;">Body&gt;50% Shadow&lt;40%</span>
+    </div>
+  </div>
+  <div class="tw"><table>
+    <thead>
+      <tr>
+        <th>Signal</th><th>Symbol</th><th>Score</th>
+        <th>Entry &#8377;</th><th>SL &#8377;</th>
+        <th>TP1 &#8377;</th><th>TP2 &#8377;</th>
+        <th>R:R</th><th>RSI</th><th>ADX</th><th>Reason</th>
+      </tr>
+    </thead>
+    <tbody>{pro_rows}</tbody>
+  </table></div>
+  <div style="display:flex;gap:18px;margin-top:12px;font-size:12px;color:#8b949e;flex-wrap:wrap;">
+    <span>R:R colour: </span>
+    <span style="color:#00c896;">&#9632; &#8805;2.0 (Excellent)</span>
+    <span style="color:#f0b429;">&#9632; &#8805;1.5 (Good)</span>
+    <span style="color:#ff4d4d;">&#9632; &lt;1.5 (Weak)</span>
+    <span style="color:#8b949e;">| Score bar: 7 green = 7/7 filters passed</span>
+  </div>
+</div>
+
+</div>
 <script>
-// ── Daily P&L Chart ──────────────────────────────────
-const ctx = document.getElementById('pnlChart').getContext('2d');
-new Chart(ctx, {{
-  type: 'bar',
-  data: {{
-    labels: {chart_labels},
-    datasets: [{{
-      label: 'Net P&L (₹)',
-      data: {chart_values},
-      backgroundColor: {chart_colors},
-      borderRadius: 4,
-    }}]
-  }},
-  options: {{
-    responsive: true,
-    plugins: {{
-      legend: {{ display: false }},
-      tooltip: {{ callbacks: {{ label: ctx => '₹' + ctx.parsed.y }} }}
-    }},
-    scales: {{
-      x: {{ ticks: {{ color:'#8b949e' }}, grid: {{ color:'#21262d' }} }},
-      y: {{ ticks: {{ color:'#8b949e', callback: v => '₹'+v }}, grid: {{ color:'#21262d' }} }}
-    }}
+function showMain(id,btn){{
+  document.querySelectorAll('.mtp').forEach(function(p){{p.classList.remove('active');}});
+  document.querySelectorAll('.mtb').forEach(function(b){{b.classList.remove('active');}});
+  document.getElementById('main-'+id).classList.add('active');
+  btn.classList.add('active');
+  window.location.hash='tab-'+id;
+}}
+function showS(id,btn){{
+  document.querySelectorAll('.sp').forEach(function(p){{p.classList.remove('active');}});
+  document.querySelectorAll('.sb').forEach(function(b){{b.classList.remove('active');}});
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  var h=window.location.hash.split('|')[0];
+  window.location.hash=h+'|screener-'+id;
+}}
+function showT(s,name,btn){{
+  document.querySelectorAll('#'+s+' .tp').forEach(function(p){{p.classList.remove('active');}});
+  document.querySelectorAll('#'+s+' .tb').forEach(function(b){{b.classList.remove('active');}});
+  document.getElementById(s+'-'+name).classList.add('active');
+  btn.classList.add('active');
+}}
+function doScan(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/scan').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
+}}
+function doScan1350(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/scan-1350').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
+}}
+function doScanGap(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/scan-gap').then(function(){{setTimeout(function(){{location.reload();}},10000);}});
+}}
+function doScanST(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/scan-supertrend').then(function(){{setTimeout(function(){{location.reload();}},15000);}});
+}}
+function showStratTab(id,btn){{
+  document.querySelectorAll('#main-signals .tp').forEach(function(p){{p.classList.remove('active');}});
+  document.querySelectorAll('#main-signals .tb').forEach(function(b){{b.classList.remove('active');}});
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}}
+function doProScan(btn){{
+  btn.textContent='⏳ Scanning...'; btn.disabled=true;
+  fetch('/pro-scan').then(function(){{setTimeout(function(){{location.reload();}},12000);}});
+}}
+(function(){{
+  var hash=window.location.hash||''; var parts=hash.split('|');
+  var mainTab='trading';
+  parts.forEach(function(p){{if(p.indexOf('tab-')===0) mainTab=p.replace('tab-','');}});
+  var mainBtn=document.querySelector('.mtb[onclick*="'+mainTab+'"]');
+  if(mainBtn){{
+    document.querySelectorAll('.mtp').forEach(function(p){{p.classList.remove('active');}});
+    document.querySelectorAll('.mtb').forEach(function(b){{b.classList.remove('active');}});
+    document.getElementById('main-'+mainTab).classList.add('active');
+    mainBtn.classList.add('active');
   }}
-}});
-
-// ── Live Price Fetcher ───────────────────────────────
-function fetchPrices() {{
+  parts.forEach(function(p){{
+    if(p.indexOf('screener-')===0){{
+      var sid=p.replace('screener-','');
+      var sBtn=document.querySelector('.sb[onclick*="'+sid+'"]');
+      if(sBtn){{
+        document.querySelectorAll('.sp').forEach(function(x){{x.classList.remove('active');}});
+        document.querySelectorAll('.sb').forEach(function(x){{x.classList.remove('active');}});
+        document.getElementById(sid).classList.add('active');
+        sBtn.classList.add('active');
+      }}
+    }}
+  }});
+}})();
+function fetchPrices(){{
   fetch('/prices')
-    .then(r => r.json())
-    .then(data => {{
-      for (const [sym, info] of Object.entries(data)) {{
-        const ltpEl  = document.getElementById('ltp-'  + sym);
-        const upnlEl = document.getElementById('upnl-' + sym);
-        if (ltpEl)  ltpEl.textContent  = '₹' + info.price;
-        if (upnlEl) {{
-          const pnl = info.unrealised_pnl;
-          upnlEl.innerHTML = `<span style="color:${{pnl>=0?'#00c896':'#ff4d4d'}}">
-            ${{pnl>=0?'+':''}}₹${{pnl}}</span>`;
+    .then(function(r){{return r.json();}})
+    .then(function(data){{
+      for(var key in data){{
+        var info = data[key];
+        var bot  = info.bot;
+        var sym  = key.replace('__2','');
+        var ltpEl  = document.getElementById('ltp-'+bot+'-'+sym);
+        var upnlEl = document.getElementById('upnl-'+bot+'-'+sym);
+        if(ltpEl) ltpEl.textContent = '&#8377;'+info.price;
+        if(upnlEl){{
+          var pnl = info.unrealised_pnl;
+          var pct = info.pct;
+          var col = pnl>=0?'#00c896':'#ff4d4d';
+          var sg  = pnl>=0?'+':'';
+          upnlEl.innerHTML = '<span style="color:'+col+';font-weight:700;">'+sg+'&#8377;'+pnl+' ('+sg+pct+'%)</span>';
         }}
       }}
-      document.getElementById('ltp-status').textContent =
-        '⟳ Prices updated ' + new Date().toLocaleTimeString('en-IN');
+      var ts = new Date().toLocaleTimeString('en-IN');
+      document.getElementById('ltp-ts').textContent = '&#8635; Prices updated '+ts;
     }})
-    .catch(() => {{
-      document.getElementById('ltp-status').textContent = '⚠️ Price fetch failed';
+    .catch(function(){{
+      document.getElementById('ltp-ts').textContent = '&#9888; Price fetch failed';
     }});
 }}
 fetchPrices();
-setInterval(fetchPrices, 30000);
-
-// ── Manual Close ─────────────────────────────────────
-function closePosition(sym, btn) {{
-  if (!confirm('Close position: ' + sym + '?')) return;
-  btn.disabled = true;
-  btn.textContent = '…';
-  fetch('/close/' + sym, {{ method: 'POST' }})
-    .then(r => r.json())
-    .then(d => {{
-      if (d.status === 'closed') {{
-        const row = document.getElementById('row-' + sym);
-        if (row) row.remove();
-        alert('✅ ' + sym + ' closed @ ₹' + d.price);
+setInterval(fetchPrices, 15000);
+function closePos(bot, sym, btn){{
+  if(!confirm('Close '+sym+' position?')) return;
+  btn.disabled=true; btn.textContent='...';
+  fetch('/close/'+bot+'/'+sym, {{method:'POST'}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      if(d.status==='closed'){{
+        var row=document.getElementById('row-'+bot+'-'+sym);
+        if(row) row.remove();
+        alert('✅ '+sym+' closed @ &#8377;'+d.price);
       }} else {{
-        alert('❌ Could not close: ' + JSON.stringify(d));
-        btn.disabled = false; btn.textContent = 'Close';
+        alert('❌ Error: '+JSON.stringify(d));
+        btn.disabled=false; btn.textContent='Close';
       }}
     }})
-    .catch(() => {{ btn.disabled=false; btn.textContent='Close'; }});
+    .catch(function(){{btn.disabled=false; btn.textContent='Close';}});
 }}
-
-// ── History Filter + Pagination ──────────────────────
-const PAGE_SIZE = 25;
-let currentPage = 1;
-
-function getVisibleRows() {{
-  const dateVal = document.getElementById('filter-date').value.trim();
-  const symVal  = document.getElementById('filter-sym').value.trim().toUpperCase();
-  const rows    = Array.from(document.querySelectorAll('#hist-tbody .hist-row'));
-  return rows.filter(r => {{
-    const dOk = !dateVal || r.dataset.date === dateVal;
-    const sOk = !symVal  || r.dataset.sym.includes(symVal);
-    return dOk && sOk;
-  }});
+function openStratTrade(strat, sym, signal, entry, sl, tp, btn){{
+  var qty = Math.floor(10000 / entry) || 1;
+  if(!confirm('Open '+signal+' '+sym+' @ ₹'+entry+' | SL:₹'+sl+' | TP:₹'+tp+' | Qty:'+qty+'?')) return;
+  btn.disabled=true; btn.textContent='...';
+  fetch('/open_strat/'+strat+'/'+sym, {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{signal:signal, entry:entry, sl:sl, tp:tp, qty:qty}})
+  }})
+  .then(function(r){{return r.json();}})
+  .then(function(d){{
+    if(d.status==='opened'){{
+      btn.textContent='✓ Open'; btn.style.background='#444';
+      alert('✅ '+sym+' '+signal+' opened @ ₹'+entry);
+    }} else {{
+      alert('⚠ '+JSON.stringify(d)); btn.disabled=false; btn.textContent='▶ Open';
+    }}
+  }})
+  .catch(function(){{btn.disabled=false; btn.textContent='▶ Open';}});
 }}
-
-function applyFilters() {{
-  currentPage = 1;
-  renderPage();
+function closeStratPos(strat, sym, btn){{
+  if(!confirm('Close '+sym+' position?')) return;
+  btn.disabled=true; btn.textContent='...';
+  fetch('/close_strat/'+strat+'/'+sym, {{method:'POST'}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      if(d.status==='closed'){{
+        var row=document.getElementById('strat-row-'+strat+'-'+sym);
+        if(row) row.remove();
+        alert('✅ '+sym+' closed @ ₹'+d.price+' | P&L: ₹'+d.pnl);
+      }} else {{
+        alert('⚠ Error: '+JSON.stringify(d)); btn.disabled=false; btn.textContent='Close';
+      }}
+    }})
+    .catch(function(){{btn.disabled=false; btn.textContent='Close';}});
 }}
-
-function renderPage() {{
-  const visible = getVisibleRows();
-  const total   = visible.length;
-  const start   = (currentPage - 1) * PAGE_SIZE;
-  const end     = start + PAGE_SIZE;
-
-  // hide/show rows
-  document.querySelectorAll('#hist-tbody .hist-row').forEach(r => r.style.display = 'none');
-  visible.slice(start, end).forEach(r => r.style.display = '');
-
-  // count label
-  document.getElementById('hist-count').textContent =
-    `Showing ${{Math.min(end, total)}} of ${{total}} trades`;
-
-  // pagination buttons
-  const pages  = Math.ceil(total / PAGE_SIZE) || 1;
-  const pg     = document.getElementById('pagination');
-  pg.innerHTML = '';
-  for (let i = 1; i <= pages; i++) {{
-    const b = document.createElement('button');
-    b.className = 'page-btn' + (i === currentPage ? ' active' : '');
-    b.textContent = i;
-    b.onclick = () => {{ currentPage = i; renderPage(); }};
-    pg.appendChild(b);
-  }}
-}}
-
-renderPage();
 </script>
 </body>
 </html>"""
     return html
 
 # ─────────────────────────────────────────────
+print("🚀 Starting Chartink Bot (Dual Screener + Signal Engine)...")
+threading.Thread(target=run_monitor,daemon=True).start()
+send(f"🟢 <b>Bot1 tazbul LIVE</b>\n💰 ₹{CAPITAL_PER_TRADE} SL:{SL_PERCENT}% TP:{TP_PERCENT}%")
+send(f"🟢 <b>Bot2 TazAmol-Test1 LIVE</b>\n💰 ₹{BOT2_CAPITAL} SL:{BOT2_SL}% TP:{BOT2_TP}%",
+     token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
 
-print("🚀 Starting Chartink Bot...")
-threading.Thread(target=run_monitor, daemon=True).start()
-send(
-    f"🟢 <b>Chartink Bot LIVE!</b>\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🧪 Mode          : {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-    f"📡 Signal        : Chartink tazbul\n"
-    f"💰 Capital/Trade : ₹{CAPITAL_PER_TRADE}\n"
-    f"🔴 Stop Loss     : {SL_PERCENT}%\n"
-    f"🟢 Take Profit   : {TP_PERCENT}%\n"
-    f"🔁 Repeat Trade  : ❌ No\n"
-    f"📊 Max Positions : Unlimited\n"
-    f"🚪 Force Exit    : 3:12 PM\n"
-    f"📋 EOD Report    : 3:30 PM"
-)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=PORT)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
