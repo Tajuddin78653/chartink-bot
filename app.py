@@ -172,7 +172,8 @@ def calc_charges(entry_price, exit_price, qty):
 # ─────────────────────────────────────────────
 #  ATR TRAILING SL — 1-min Yahoo candles
 # ─────────────────────────────────────────────
-def fetch_candles(symbol, period="1d", interval="1m"):
+def _fetch_candles_atr(symbol, period="1d", interval="1m"):
+    """ATR trailing SL candles — raw HTTP, returns list of dicts. Separate from signal engine fetch_candles."""
     try:
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS"
                f"?interval={interval}&range={period}")
@@ -186,7 +187,7 @@ def fetch_candles(symbol, period="1d", interval="1m"):
                 for i in range(len(closes))
                 if None not in (opens[i],highs[i],lows[i],closes[i])]
     except Exception as e:
-        print(f"⚠️ Candles {symbol}: {e}"); return []
+        print(f"⚠️ ATR candles {symbol}: {e}"); return []
 
 def calc_atr(candles, period=ATR_PERIOD):
     if len(candles) < period + 1: return None
@@ -246,7 +247,7 @@ def get_price(symbol, chartink_price=None):
 
 def calculate_trade(symbol, price, sl_pct, tp_pct, capital):
     # For bot1 (tazbul) use ATR trailing SL; for other bots keep fixed %
-    candles = fetch_candles(symbol)
+    candles = _fetch_candles_atr(symbol)
     atr_sl, atr_val = calc_atr_sl(candles)
     sl  = atr_sl if (atr_sl and sl_pct == SL_PERCENT) else round(price*(1-sl_pct/100),2)
     tp  = round(price*(1+tp_pct/100),2)
@@ -1124,7 +1125,7 @@ def check_positions():
         if not p: continue
         changed=False
         # Update ATR trailing SL
-        candles=fetch_candles(sym)
+        candles=_fetch_candles_atr(sym)
         new_sl,new_atr=calc_atr_sl(candles,current_atr_sl=t["sl"])
         if new_sl and new_sl!=t["sl"]:
             t["sl"]=new_sl; t["atr_val"]=new_atr; changed=True
