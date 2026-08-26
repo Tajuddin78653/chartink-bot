@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, time as dtime
-import pytz, os, time, threading, requests, csv
+import pytz, os, time, threading, requests, csv, json
 
 app = Flask(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -34,8 +34,64 @@ ATR_TP_MULT    = 2.0
 ADX_TREND_MIN  = 20
 
 # ── State ─────────────────────────────────────
-open_trades   = {}; closed_today  = []; traded_today  = set()
-open_trades2  = {}; closed_today2 = []; traded_today2 = set()
+# File-based persistence — survives Render restarts.
+# Written on every trade open/close; loaded at startup.
+# Falls back to empty state silently if file missing.
+_STATE_FILE = "logs/state.json"
+
+def _load_state():
+    """Load persisted state from disk. Returns dict with all state buckets."""
+    try:
+        if os.path.exists(_STATE_FILE):
+            with open(_STATE_FILE, "r") as f:
+                s = json.load(f)
+            print(f"✅ State loaded: bot1 open={len(s.get('open_trades',{}))} traded={len(s.get('traded_today',[]))}")
+            return s
+    except Exception as e:
+        print(f"⚠️ State load failed ({e}) — starting fresh")
+    return {}
+
+def _save_state():
+    """Persist all trading state to disk atomically."""
+    try:
+        tmp = _STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "open_trades"  : open_trades,
+                "open_trades2" : open_trades2,
+                "closed_today" : closed_today,
+                "closed_today2": closed_today2,
+                "traded_today" : list(traded_today),
+                "traded_today2": list(traded_today2),
+                "saved_date"   : datetime.now(IST).strftime("%Y-%m-%d"),
+            }, f)
+        os.replace(tmp, _STATE_FILE)   # atomic write
+    except Exception as e:
+        print(f"⚠️ State save failed: {e}")
+
+def _clear_state_if_new_day():
+    """If saved_date != today, wipe traded/closed so each day starts fresh."""
+    try:
+        if os.path.exists(_STATE_FILE):
+            with open(_STATE_FILE, "r") as f:
+                s = json.load(f)
+            saved = s.get("saved_date", "")
+            today = datetime.now(IST).strftime("%Y-%m-%d")
+            if saved != today:
+                print(f"📅 New day ({today}) — clearing daily state")
+                os.remove(_STATE_FILE)
+    except Exception as e:
+        print(f"⚠️ Day-check failed: {e}")
+
+# ── Load persisted state at startup ───────────
+_clear_state_if_new_day()
+_s = _load_state()
+open_trades   = _s.get("open_trades",   {})
+open_trades2  = _s.get("open_trades2",  {})
+closed_today  = _s.get("closed_today",  [])
+closed_today2 = _s.get("closed_today2", [])
+traded_today  = set(_s.get("traded_today",  []))
+traded_today2 = set(_s.get("traded_today2", []))
 
 # ── NSE cache ─────────────────────────────────
 _nse_cache = {}; _nse_cache_time = 0; NSE_CACHE_TTL = 120
@@ -1029,7 +1085,7 @@ def run_st_scan():
 def open_trade(symbol, price):
     if symbol in open_trades or symbol in traded_today: return
     trade=calculate_trade(symbol,price,SL_PERCENT,TP_PERCENT,CAPITAL_PER_TRADE)
-    open_trades[symbol]=trade; traded_today.add(symbol)
+    open_trades[symbol]=trade; traded_today.add(symbol); _save_state()
     atr_tag = f"₹{trade['atr_val']}" if trade.get('atr_val') else "calculating…"
     send(f"📝 <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} ENTRY — tazbul</b>\n"
          f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1057,6 +1113,7 @@ def close_trade(symbol, exit_price, reason):
          f"📝 {reason}\n🕐 {trade['exit_time']}")
     closed_today.append({"symbol":symbol,"pnl":net_pnl,"charges":charges,"gross_pnl":gross_pnl})
     log_trade(trade,exit_price,gross_pnl,charges,net_pnl,reason,"logs/trades.csv")
+    _save_state()
 
 def check_positions():
     for sym in list(open_trades):
@@ -1084,7 +1141,7 @@ def check_positions():
         if p<=t["sl"]:
             if changed: open_trades[sym]=t
             close_trade(sym,p,"🔴 ATR Trailing SL Hit" if not t.get("tp_hit") else "🔴 ATR SL Hit (after TP)"); continue
-        if changed: open_trades[sym]=t
+        if changed: open_trades[sym]=t; _save_state()
 
 def send_eod():
     w=[t for t in closed_today if t["pnl"]>=0]; l=[t for t in closed_today if t["pnl"]<0]
@@ -1097,7 +1154,7 @@ def send_eod():
          f"💹 Gross: {'+'if gross>=0 else ''}₹{gross}\n"
          f"🏦 Charges: -₹{total_ch} (Dhan)\n"
          f"{'💚' if net>=0 else '❤️'} Net: {'+'if net>=0 else ''}₹{net}")
-    closed_today.clear(); traded_today.clear()
+    closed_today.clear(); traded_today.clear(); _save_state()
 
 # ─────────────────────────────────────────────
 #  BOT 2 — TazAmol-Test1
@@ -1105,7 +1162,7 @@ def send_eod():
 def open_trade2(symbol, price):
     if symbol in open_trades2 or symbol in traded_today2: return
     trade=calculate_trade(symbol,price,BOT2_SL,BOT2_TP,BOT2_CAPITAL)
-    open_trades2[symbol]=trade; traded_today2.add(symbol)
+    open_trades2[symbol]=trade; traded_today2.add(symbol); _save_state()
     send(f"📝 <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} ENTRY — TazAmol</b>\n"
          f"━━━━━━━━━━━━━━━━━━━━\n"
          f"📌 Stock : <b>{symbol}</b>\n"
@@ -1130,6 +1187,7 @@ def close_trade2(symbol, exit_price, reason):
          token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
     closed_today2.append({"symbol":symbol,"pnl":pnl})
     log_trade(trade,exit_price,pnl,reason,"logs/trades2.csv")
+    _save_state()
 
 def check_positions2():
     for sym in list(open_trades2):
@@ -1148,7 +1206,7 @@ def send_eod2():
          f"📊 Trades:{len(closed_today2)} ✅{len(w)} ❌{len(l)}\n"
          f"{'💚' if net>=0 else '❤️'} Net: ₹{net}",
          token=BOT2_TOKEN,chat_id=BOT2_CHAT_ID)
-    closed_today2.clear(); traded_today2.clear()
+    closed_today2.clear(); traded_today2.clear(); _save_state()
 
 # ─────────────────────────────────────────────
 #  MONITOR
