@@ -9,8 +9,10 @@ os.makedirs("logs", exist_ok=True)
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
 CHAT_ID           = os.environ.get("CHAT_ID", "")
 CAPITAL_PER_TRADE = 10000
-SL_PERCENT        = 1.0
-TP_PERCENT        = 1.5
+SL_PERCENT        = 1.0          # kept for legacy; ATR trailing SL is used instead
+TP_PERCENT        = 0.05         # first TP target (0.05%), then trailing TP at same step
+ATR_PERIOD        = 21           # ATR period for trailing SL
+ATR_MULT          = 3            # multiplier (points mode: SL = price - ATR*mult)
 PAPER_TRADING     = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 PORT              = int(os.environ.get("PORT", 10000))
 BROKER            = os.environ.get("BROKER", "dhan")   # "dhan" (more brokers later)
@@ -167,6 +169,63 @@ def get_price(symbol, chartink_price=None):
     return None
 
 # ─────────────────────────────────────────────
+#  ATR TRAILING STOP — 1-min candles via Yahoo
+#  period=21, multiplier=3, points mode (no %)
+#  atr_sl = highest_high_since_entry - ATR*mult
+#  (for long trades; ratchets up, never down)
+# ─────────────────────────────────────────────
+def fetch_candles(symbol, period="1d", interval="1m"):
+    """Fetch OHLC candles from Yahoo Finance. Returns list of dicts."""
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.NS"
+               f"?interval={interval}&range={period}")
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = r.json()["chart"]["result"][0]
+        ts     = data["timestamp"]
+        opens  = data["indicators"]["quote"][0]["open"]
+        highs  = data["indicators"]["quote"][0]["high"]
+        lows   = data["indicators"]["quote"][0]["low"]
+        closes = data["indicators"]["quote"][0]["close"]
+        candles = []
+        for i in range(len(ts)):
+            if None in (opens[i], highs[i], lows[i], closes[i]):
+                continue
+            candles.append({"o": opens[i], "h": highs[i], "l": lows[i], "c": closes[i]})
+        return candles
+    except Exception as e:
+        print(f"⚠️ Candle fetch failed {symbol}: {e}")
+        return []
+
+def calc_atr(candles, period=ATR_PERIOD):
+    """Compute ATR using simple average of True Range over last `period` bars."""
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    return round(sum(trs[-period:]) / period, 4)
+
+def calc_atr_sl(candles, mult=ATR_MULT, current_atr_sl=None):
+    """
+    ATR trailing stop (points mode, long side).
+    new_sl = latest_close - ATR * mult
+    Never moves down — ratchets up only.
+    Returns (new_sl, atr_value).
+    """
+    atr = calc_atr(candles)
+    if atr is None or not candles:
+        return current_atr_sl, None
+    latest_close = candles[-1]["c"]
+    raw_sl = round(latest_close - atr * mult, 2)
+    # ratchet: never let SL move down
+    if current_atr_sl is not None:
+        raw_sl = max(raw_sl, current_atr_sl)
+    return raw_sl, atr
+
+# ─────────────────────────────────────────────
 #  BROKER CHARGES — Dhan Equity Intraday (MIS)
 #  Both entry + exit orders are counted.
 #  Dhan: ₹20 per order OR 0.03% of turnover,
@@ -204,18 +263,24 @@ def calc_charges(entry_price, exit_price, qty):
     return total
 
 def calculate(symbol, price):
-    sl_price   = round(price * (1 - SL_PERCENT / 100), 2)
-    tp_price   = round(price * (1 + TP_PERCENT / 100), 2)
-    sl_dist    = round(price - sl_price, 2)
-    qty        = max(1, int(CAPITAL_PER_TRADE / price))
-    risk_amt   = round(sl_dist * qty, 2)
+    # Initial ATR SL: fetch candles at entry; fallback to fixed 1% if ATR unavailable
+    candles  = fetch_candles(symbol)
+    atr_sl, atr_val = calc_atr_sl(candles, current_atr_sl=None)
+    sl_price = atr_sl if atr_sl else round(price * (1 - SL_PERCENT / 100), 2)
+    tp_price = round(price * (1 + TP_PERCENT / 100), 2)   # first TP at 0.05%
+    sl_dist  = round(price - sl_price, 2)
+    qty      = max(1, int(CAPITAL_PER_TRADE / price))
+    risk_amt = round(sl_dist * qty, 2)
     reward_amt = round((tp_price - price) * qty, 2)
     return {
         "symbol"      : symbol,
         "entry"       : price,
         "qty"         : qty,
-        "sl"          : sl_price,
-        "tp"          : tp_price,
+        "sl"          : sl_price,            # ATR trailing SL (updates every monitor tick)
+        "tp"          : tp_price,            # first TP level (0.05%)
+        "atr_val"     : atr_val,             # last computed ATR value
+        "trail_tp"    : None,                # None = first TP not yet hit; float = trailing TP active
+        "tp_hit"      : False,               # flag: has first TP been reached?
         "capital_used": round(qty * price, 2),
         "risk_amt"    : risk_amt,
         "reward_amt"  : reward_amt,
@@ -234,15 +299,17 @@ def open_trade(symbol, price):
     open_trades[symbol] = trade
     _state.set_open_trades(open_trades)
     _state.add_traded_today(symbol)
-    mode = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
+    mode    = "🧪 PAPER" if PAPER_TRADING else "⚡ LIVE"
+    atr_tag = f"₹{trade['atr_val']}" if trade.get('atr_val') else "calculating…"
     send(
         f"📝 <b>{mode} TRADE ENTRY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 Stock      : <b>{symbol}</b>\n"
         f"💰 Entry      : ₹{price}\n"
         f"📦 Quantity   : {trade['qty']} shares\n"
-        f"🔴 Stop Loss  : ₹{trade['sl']} ({SL_PERCENT}%)\n"
-        f"🟢 Take Profit: ₹{trade['tp']} ({TP_PERCENT}%)\n"
+        f"🔴 ATR SL     : ₹{trade['sl']} (ATR×{ATR_MULT}={atr_tag})\n"
+        f"🟢 First TP   : ₹{trade['tp']} ({TP_PERCENT}%)\n"
+        f"📈 Trail TP   : 0.05% step once TP hit\n"
         f"💵 Capital    : ₹{trade['capital_used']}\n"
         f"⚠️ Risk       : ₹{trade['risk_amt']}\n"
         f"🎯 Reward     : ₹{trade['reward_amt']}\n"
@@ -311,11 +378,72 @@ def check_positions():
         price = get_price(symbol)
         if not price:
             continue
-        print(f"📈 {symbol}: ₹{price} SL:₹{trade['sl']} TP:₹{trade['tp']}")
-        if price >= trade["tp"]:
-            close_trade(symbol, price, "🎯 Take Profit Hit")
-        elif price <= trade["sl"]:
-            close_trade(symbol, price, "🔴 Stop Loss Hit")
+
+        changed = False
+
+        # ── 1. Update ATR trailing SL every tick ──────────────────
+        candles = fetch_candles(symbol)
+        new_atr_sl, new_atr_val = calc_atr_sl(candles, current_atr_sl=trade["sl"])
+        if new_atr_sl and new_atr_sl != trade["sl"]:
+            print(f"📐 {symbol} ATR SL: ₹{trade['sl']} → ₹{new_atr_sl}  (ATR={new_atr_val})")
+            trade["sl"]      = new_atr_sl
+            trade["atr_val"] = new_atr_val
+            changed = True
+
+        # ── 2. Trailing TP logic ───────────────────────────────────
+        if not trade.get("tp_hit"):
+            # Phase 1: waiting for first TP hit (price >= entry * 1.0005)
+            if price >= trade["tp"]:
+                trade["tp_hit"]   = True
+                trade["trail_tp"] = round(price * (1 + TP_PERCENT / 100), 2)
+                changed = True
+                send(
+                    f"🎯 <b>First TP Hit — Trailing TP Activated</b>\n"
+                    f"📌 {symbol} @ ₹{price}\n"
+                    f"📈 Trailing TP locked at: ₹{trade['trail_tp']}\n"
+                    f"🔴 ATR SL: ₹{trade['sl']}"
+                )
+                print(f"🎯 {symbol} first TP @ ₹{price}, trail_tp=₹{trade['trail_tp']}")
+        else:
+            # Phase 2: trailing TP active
+            # Ratchet trail_tp up as price rises (new level = price * 1.0005)
+            new_trail = round(price * (1 + TP_PERCENT / 100), 2)
+            if new_trail > trade["trail_tp"]:
+                print(f"📈 {symbol} trail_tp ratchet: ₹{trade['trail_tp']} → ₹{new_trail}")
+                trade["trail_tp"] = new_trail
+                changed = True
+            # Exit when price retraces below (trail_tp - one 0.05% step)
+            # i.e. price has pulled back one full TP step from the locked trail
+            exit_trigger = round(trade["trail_tp"] / (1 + TP_PERCENT / 100), 2)
+            if price <= exit_trigger:
+                # save state before close_trade pops the trade
+                if changed:
+                    cur = _state.get_open_trades()
+                    if symbol in cur:
+                        cur[symbol] = trade
+                        _state.set_open_trades(cur)
+                close_trade(symbol, price, "📈 Trailing TP Exit")
+                continue
+
+        # ── 3. ATR SL exit ────────────────────────────────────────
+        print(f"📊 {symbol}: ₹{price} | ATR SL:₹{trade['sl']} | "
+              f"trail_tp:{trade.get('trail_tp') or '—'} | tp_hit:{trade.get('tp_hit')}")
+        if price <= trade["sl"]:
+            if changed:
+                cur = _state.get_open_trades()
+                if symbol in cur:
+                    cur[symbol] = trade
+                    _state.set_open_trades(cur)
+            reason = "🔴 ATR Trailing SL Hit" if not trade.get("tp_hit") else "🔴 ATR SL Hit (after TP)"
+            close_trade(symbol, price, reason)
+            continue
+
+        # ── 4. Persist updated trade state ────────────────────────
+        if changed:
+            cur = _state.get_open_trades()
+            if symbol in cur:
+                cur[symbol] = trade
+                _state.set_open_trades(cur)
 
 def send_eod():
     closed_today = _state.get_closed_today()
