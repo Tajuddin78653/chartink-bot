@@ -647,7 +647,7 @@ def dashboard():
     from collections import defaultdict
     day_pnl = defaultdict(float)
     for r in history:
-        day_pnl[r["date"]] += float(r["pnl"])
+        day_pnl[r["date"]] += float(r.get("net_pnl", r.get("pnl", 0)))
     sorted_days  = sorted(day_pnl.keys())[-14:]
     chart_labels = json.dumps(sorted_days)
     chart_values = json.dumps([round(day_pnl[d], 2) for d in sorted_days])
@@ -656,13 +656,19 @@ def dashboard():
     # ── open positions table rows ──
     open_rows = ""
     for sym, t in open_trades.items():
+        tp_hit     = t.get("tp_hit", False)
+        trail_tp   = t.get("trail_tp")
+        atr_val    = t.get("atr_val", "—")
+        # Show trailing TP if activated, else first TP target
+        tp_display = f"₹{trail_tp} 🔄" if tp_hit and trail_tp else f"₹{t['tp']}"
+        tp_class   = "text-info" if tp_hit else "text-success"
         open_rows += f"""
         <tr id="row-{sym}">
           <td><b>{sym}</b></td>
           <td>₹{t['entry']}</td>
           <td>{t['qty']}</td>
-          <td class="text-danger">₹{t['sl']}</td>
-          <td class="text-success">₹{t['tp']}</td>
+          <td class="text-danger" title="ATR({ATR_PERIOD})×{ATR_MULT} = ₹{atr_val}">₹{t['sl']}</td>
+          <td class="{tp_class}">{tp_display}</td>
           <td>₹{t['capital_used']}</td>
           <td id="ltp-{sym}"><span class="text-muted">fetching…</span></td>
           <td id="upnl-{sym}"><span class="text-muted">—</span></td>
@@ -801,12 +807,14 @@ def dashboard():
     <div class="tab-pane fade show active" id="tab-open">
       <div class="card"><div class="table-responsive">
         <table class="table table-dark table-hover mb-0">
-          <thead><tr>
-            <th>Stock</th><th>Entry</th><th>Qty</th>
-            <th>Stop Loss</th><th>Take Profit</th><th>Capital</th>
-            <th>Live Price</th><th>Unrealised P&L</th>
-            <th>Entry Time</th><th>Action</th>
-          </tr></thead>
+         <thead><tr>
+           <th>Stock</th><th>Entry</th><th>Qty</th>
+           <th title="ATR(21)×3 trailing stop">ATR SL 📐</th>
+           <th title="First TP 0.05% → then trailing">TP / Trail 📈</th>
+           <th>Capital</th>
+           <th>Live Price</th><th>Unrealised P&L</th>
+           <th>Entry Time</th><th>Action</th>
+         </tr></thead>
           <tbody id="open-tbody">{open_rows}</tbody>
         </table>
       </div></div>
