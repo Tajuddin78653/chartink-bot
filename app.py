@@ -1100,6 +1100,7 @@ def open_trade(symbol, price):
 def close_trade(symbol, exit_price, reason):
     if symbol not in open_trades: return
     trade=open_trades.pop(symbol); trade["exit_time"]=time_str()
+    traded_today.add(symbol)   # re-add so same stock can't re-enter today after closing
     gross_pnl = round((exit_price-trade["entry"])*trade["qty"],2)
     charges   = calc_charges(trade["entry"],exit_price,trade["qty"])
     net_pnl   = round(gross_pnl-charges,2)
@@ -1177,6 +1178,7 @@ def open_trade2(symbol, price):
 def close_trade2(symbol, exit_price, reason):
     if symbol not in open_trades2: return
     trade=open_trades2.pop(symbol); trade["exit_time"]=time_str()
+    traded_today2.add(symbol)   # re-add so same stock can't re-enter today after closing
     pnl=round((exit_price-trade["entry"])*trade["qty"],2)
     send(f"{'✅' if pnl>=0 else '❌'} <b>{'🧪 PAPER' if PAPER_TRADING else '⚡ LIVE'} EXIT — TazAmol</b>\n"
          f"━━━━━━━━━━━━━━━━━━━━\n"
